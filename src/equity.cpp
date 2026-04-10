@@ -6,6 +6,15 @@
 #include <random>
 #include <set>
 
+namespace {
+
+char rank_to_char(Rank rank) {
+  static const char *ranks = "23456789TJQKA";
+  return ranks[rank];
+}
+
+} // namespace
+
 // --- Internal Hand Evaluation Logic ---
 
 // Helper to sort cards by rank descending
@@ -212,6 +221,38 @@ int EquityModule::bucketize_hand(const std::vector<Card> &hero_hand,
     return BucketID::STRONG_DRAW;
 
   return BucketID::AIR;
+}
+
+std::string EquityModule::canonical_state_signature(
+    const std::vector<Card> &hero_hand, const std::vector<Card> &board_cards) const {
+  std::vector<Card> cards = hero_hand;
+  cards.insert(cards.end(), board_cards.begin(), board_cards.end());
+
+  std::sort(cards.begin(), cards.end(), [](const Card &lhs, const Card &rhs) {
+    if (lhs.rank != rhs.rank)
+      return lhs.rank > rhs.rank;
+    return lhs.suit < rhs.suit;
+  });
+
+  std::map<Suit, char> suit_map;
+  char next_label = 'a';
+  std::string signature;
+  signature.reserve(cards.size() * 3);
+
+  for (const auto &card : cards) {
+    auto it = suit_map.find(card.suit);
+    if (it == suit_map.end()) {
+      it = suit_map.emplace(card.suit, next_label).first;
+      if (next_label < 'd')
+        ++next_label;
+    }
+
+    signature.push_back(rank_to_char(card.rank));
+    signature.push_back(it->second);
+    signature.push_back('|');
+  }
+
+  return signature.empty() ? "_" : signature;
 }
 
 // Fast Monte Carlo simulation for display equity
