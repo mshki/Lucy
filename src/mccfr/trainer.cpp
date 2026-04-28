@@ -5,16 +5,20 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <stdexcept>
 
-// Removed depth limit - let CFR explore freely
-// static const int MAX_CFR_DEPTH = 50;
+Trainer::Trainer(GameState *g)
+    : game(g), em(*(g->equity_module)), node_matrix_(kMaxActions) {}
 
-Trainer::Trainer(GameState *g) : game(g), em(*(g->equity_module)) {}
+Trainer::~Trainer() = default;
 
-Trainer::~Trainer() {
-  for (auto &itr : node_map) {
-    delete itr.second;
-  }
+int Trainer::get_or_create_node_id(const std::string &info, int n_actions) {
+  auto it = info_to_id_.find(info);
+  if (it != info_to_id_.end())
+    return it->second;
+  int id = node_matrix_.add_node(n_actions);
+  info_to_id_.emplace(info, id);
+  return id;
 }
 
 // Helper function to deal random hole cards
@@ -78,7 +82,7 @@ void Trainer::deal_random_community_cards(GameState &state, int num_cards,
   }
 }
 
-void Trainer::train(int iterations, int num_players) {
+void Trainer::train(int iterations, int /*num_players*/) {
   if (!game) {
     return;
   }
@@ -90,11 +94,13 @@ void Trainer::train(int iterations, int num_players) {
   std::vector<int> player_counts = {2, 3, 4, 5, 6};
   std::vector<double> stack_bb_options = {10, 25, 50, 100, 200};
 
+  int batched_traversals = 0;
+
   for (int i = 0; i < iterations; ++i) {
 
     if (i % 100 == 0) {
       std::cout << "Iteration " << i << "/" << iterations
-                << " — nodes=" << node_map.size() << "\n";
+                << " — nodes=" << node_matrix_.num_nodes() << "\n";
     }
 
     // Randomly sample configuration
@@ -109,35 +115,26 @@ void Trainer::train(int iterations, int num_players) {
 
     // External sampling: traverse from each player's perspective
     for (int traverser = 0; traverser < sampled_players; ++traverser) {
-      if (i == 0)
-        std::cout << "DEBUG: Starting traverser " << traverser << "\n";
-
       GameState s(nullptr, game->equity_module);
-
-      // Proper initialization using correct constructor logic
       s.init_game_setup(sampled_players, stack, sb, bb);
-
-      // start_hand() now works correctly
       s.start_hand();
-      if (i == 0)
-        std::cout << "DEBUG: Dealing hole cards\n";
       deal_random_hole_cards(s, gen);
-      if (i == 0)
-        std::cout << "DEBUG: Hole cards dealt\n";
 
-      // CFR ENTRY POINT
-      if (i == 0)
-        std::cout << "DEBUG: Calling CFR\n";
-        std::vector<double> reach(sampled_players, 1.0);
-      cfr(s, traverser,
-          1.0, // prob_traverser
-          reach, 
-          1.0, // prob_chance
-          gen, 0);
-      if (i == 0)
-        std::cout << "DEBUG: CFR returned\n";
+      std::vector<double> reach(sampled_players, 1.0);
+      cfr(s, traverser, 1.0, reach, 1.0, gen, 0);
+
+      if (++batched_traversals >= batch_size_) {
+        node_matrix_.flush();
+        batched_traversals = 0;
+      }
     }
   }
+
+  // Final flush so any leftover deltas land in the strategy_sum.
+  if (batched_traversals > 0) {
+    node_matrix_.flush();
+  }
+
   std::cout << "Training complete: " << iterations << " iterations\n";
 }
 
@@ -169,7 +166,7 @@ std::vector<double> Trainer::calculate_payoffs(GameState &state) {
     Player *p = state.get_player(i);
 
     if (p->is_folded) {
-      // already set: payoff[i] = -p->current_bet;
+      // already set above
     } else if (rank[i] == best_rank) {
       payoff[i] = pot - p->total_bet_size;
     } else {
@@ -185,34 +182,20 @@ double Trainer::get_terminal_payoff(GameState &state, int player_id) {
 }
 
 double Trainer::cfr(GameState &state, int traverser, double prob_traverser,
-                    std::vector<double> &reach, double prob_chance, std::mt19937 &gen,
-                    int depth) {
-  //
-  // Terminal check
-  //
+                    std::vector<double> &reach, double prob_chance,
+                    std::mt19937 &gen, int depth) {
   if (state.is_terminal() || depth > 200)
     return get_terminal_payoff(state, traverser);
 
-  //
-  // STREET TRANSITION 
-  //
   if (state.is_betting_round_over() && state.stage != Stage::SHOWDOWN) {
     if (state.stage == Stage::PREFLOP && state.community_cards.empty()) {
       deal_random_community_cards(state, 3, gen);
-      // state.stage = Stage::FLOP;
-      // state.next_street();
     } else if (state.stage == Stage::FLOP &&
                state.community_cards.size() == 3) {
       deal_random_community_cards(state, 1, gen);
-      // state.stage = Stage::TURN;
-      // state.next_street();
     } else if (state.stage == Stage::TURN &&
                state.community_cards.size() == 4) {
       deal_random_community_cards(state, 1, gen);
-      // state.stage = Stage::RIVER;
-      // state.next_street();
-    } else {
-      // state.next_street();
     }
     state.next_street();
 
@@ -226,34 +209,28 @@ double Trainer::cfr(GameState &state, int traverser, double prob_traverser,
   }
   int acting = curr->id;
 
-  //
-  // Build info set (your GameState no longer appends legal-action count)
-  //
   std::string info = state.compute_information_set(acting);
 
-  //
-  // Legal actions according to your NEW abstraction system
-  //
   auto legal = state.get_legal_actions();
   if (legal.empty())
     return get_terminal_payoff(state, traverser);
 
-  //
-  // Node lookup
-  //
-  if (node_map.count(info) <= 0)
-    node_map[info] = new Node(legal.size());
+  if (static_cast<int>(legal.size()) > kMaxActions) {
+    throw std::runtime_error("Trainer::cfr: legal action count exceeds "
+                             "kMaxActions; bump kMaxActions in trainer.h");
+  }
 
-  Node *node = node_map[info];
-  std::vector<double> strategy = node->get_strategy(reach[curr->id]);
+  int node_id = get_or_create_node_id(info, static_cast<int>(legal.size()));
 
-  //
+  // Strategy snapshot from cache (uniform on the very first visit).
+  const double *strat_row = node_matrix_.strategy_row(node_id);
+  std::vector<double> strategy(strat_row, strat_row + legal.size());
+  node_matrix_.accumulate_realization_weight(node_id, reach[curr->id]);
+
   // -----------------------------------------------------
   //     TRAVERSER — EXPLORE ALL ACTIONS
   // -----------------------------------------------------
-  //
   if (acting == traverser) {
-
     double node_util = 0.0;
     std::vector<double> utils(legal.size());
 
@@ -264,37 +241,30 @@ double Trainer::cfr(GameState &state, int traverser, double prob_traverser,
       std::vector<double> next_reach = reach;
       next_reach[traverser] *= strategy[i];
 
-      utils[i] = cfr(next, traverser, prob_traverser * strategy[i],
-                     next_reach, prob_chance, gen, depth + 1);
+      utils[i] = cfr(next, traverser, prob_traverser * strategy[i], next_reach,
+                     prob_chance, gen, depth + 1);
 
       node_util += strategy[i] * utils[i];
     }
 
-    //
-    // Regret scaled by opponent reach × chance reach
-    //
     double scale = prob_chance;
-
     for (size_t p = 0; p < reach.size(); ++p) {
-      if ((int) p != traverser) {
+      if ((int)p != traverser) {
         scale *= reach[p];
-      }   
+      }
     }
-            
 
     for (size_t i = 0; i < legal.size(); ++i) {
       double regret = (utils[i] - node_util) * scale;
-      node->update_regret_sum(i, regret);
+      node_matrix_.accumulate_regret(node_id, static_cast<int>(i), regret);
     }
 
     return node_util;
   }
 
-  //
   // -----------------------------------------------------
-  //     OPPONENT — SAMPLE ONE ACTION only
+  //     OPPONENT — SAMPLE ONE ACTION
   // -----------------------------------------------------
-  //
   std::discrete_distribution<> dist(strategy.begin(), strategy.end());
   int a = dist(gen);
 
@@ -304,27 +274,16 @@ double Trainer::cfr(GameState &state, int traverser, double prob_traverser,
   std::vector<double> next_reach = reach;
   next_reach[acting] *= strategy[a];
 
-  return cfr(next, traverser, prob_traverser, next_reach,
-             prob_chance, gen, depth + 1);
+  return cfr(next, traverser, prob_traverser, next_reach, prob_chance, gen,
+             depth + 1);
 }
-
-//
-// ----------------------------------------------
-// Strategy exposure
-// ----------------------------------------------
-//
 
 std::vector<double> Trainer::get_strategy(const std::string &info) {
-  if (node_map.count(info) > 0)
-    return node_map[info]->get_average_strategy();
-  return {};
+  auto it = info_to_id_.find(info);
+  if (it == info_to_id_.end())
+    return {};
+  return node_matrix_.average_strategy(it->second);
 }
-
-//
-// ----------------------------------------------
-// Action recommendation
-// ----------------------------------------------
-//
 
 Action Trainer::get_action_recommendation(GameState &state, int player_id,
                                           std::vector<double> &probs) {
@@ -347,12 +306,6 @@ Action Trainer::get_action_recommendation(GameState &state, int player_id,
   return legal[idx];
 }
 
-//
-// ----------------------------------------------
-// Save/Load nodes
-// ----------------------------------------------
-//
-
 void Trainer::save_to_file(const std::string &fn) {
   std::ofstream out(fn, std::ios::binary);
   if (!out) {
@@ -360,15 +313,15 @@ void Trainer::save_to_file(const std::string &fn) {
     return;
   }
 
-  size_t N = node_map.size();
+  size_t N = info_to_id_.size();
   out.write((char *)&N, sizeof(N));
 
-  for (auto &[key, node] : node_map) {
+  for (auto &[key, id] : info_to_id_) {
     size_t len = key.size();
     out.write((char *)&len, sizeof(len));
     out.write(key.c_str(), len);
 
-    auto sum = node->get_strategy_sum();
+    auto sum = node_matrix_.strategy_sum_row(id);
     size_t k = sum.size();
     out.write((char *)&k, sizeof(k));
     out.write((char *)sum.data(), sizeof(double) * k);
@@ -382,9 +335,9 @@ void Trainer::load_from_file(const std::string &fn) {
     return;
   }
 
-  for (auto &[k, n] : node_map)
-    delete n;
-  node_map.clear();
+  // Reset state.
+  info_to_id_.clear();
+  node_matrix_ = NodeMatrix(kMaxActions);
 
   size_t N;
   in.read((char *)&N, sizeof(N));
@@ -402,9 +355,8 @@ void Trainer::load_from_file(const std::string &fn) {
     std::vector<double> sum(k);
     in.read((char *)sum.data(), sizeof(double) * k);
 
-    Node *node = new Node(k);
-    node->set_strategy_sum(sum);
-
-    node_map[key] = node;
+    int id = node_matrix_.add_node(static_cast<int>(k));
+    info_to_id_.emplace(std::move(key), id);
+    node_matrix_.load_strategy_sum_row(id, sum);
   }
 }

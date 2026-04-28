@@ -14,7 +14,7 @@ endif()
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/include/mccfr)
 
-# src files
+# Core C++ sources (game engine + trainer + node matrix host code)
 set(SOURCES
     src/main.cpp
     src/equity.cpp
@@ -22,17 +22,30 @@ set(SOURCES
     src/game_state.cpp
     src/mccfr/trainer.cpp
     src/mccfr/node.cpp
+    src/mccfr/node_matrix.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -pedantic)
 
-# output directory 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
 )
 
+# Pick the kernel backend: real CUDA when available, CPU fallback otherwise.
+if(CMAKE_CUDA_COMPILER)
+    target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels.cu)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+    )
+else()
+    target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels_cpu.cpp)
+endif()
+
+# Demo executable (kernel sandbox) — only when CUDA is available.
 if(CMAKE_CUDA_COMPILER)
     add_executable(demo_code demo_code.cu)
     target_compile_features(demo_code PRIVATE cxx_std_20)
