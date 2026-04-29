@@ -1,84 +1,57 @@
 #include "../include/game_state.h"
 #include "../include/mccfr/trainer.h"
+#include "../include/external/json.hpp"
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
+using nlohmann::json;
 using namespace std;
 
-// --- Helper Functions ---
+// ============================================================================
+// Card parsing (used by both interactive solver mode and the JSON serve mode)
+// ============================================================================
 
-Card parse_card(const string &s) {
+static Card parse_card(const string &s) {
   if (s.length() != 2)
     return Card(Rank::TWO, Suit::CLUBS);
 
   Rank r;
   switch (s[0]) {
-  case '2':
-    r = Rank::TWO;
-    break;
-  case '3':
-    r = Rank::THREE;
-    break;
-  case '4':
-    r = Rank::FOUR;
-    break;
-  case '5':
-    r = Rank::FIVE;
-    break;
-  case '6':
-    r = Rank::SIX;
-    break;
-  case '7':
-    r = Rank::SEVEN;
-    break;
-  case '8':
-    r = Rank::EIGHT;
-    break;
-  case '9':
-    r = Rank::NINE;
-    break;
-  case 'T':
-    r = Rank::TEN;
-    break;
-  case 'J':
-    r = Rank::JACK;
-    break;
-  case 'Q':
-    r = Rank::QUEEN;
-    break;
-  case 'K':
-    r = Rank::KING;
-    break;
-  case 'A':
-    r = Rank::ACE;
-    break;
-  default:
-    r = Rank::TWO;
+  case '2': r = Rank::TWO; break;
+  case '3': r = Rank::THREE; break;
+  case '4': r = Rank::FOUR; break;
+  case '5': r = Rank::FIVE; break;
+  case '6': r = Rank::SIX; break;
+  case '7': r = Rank::SEVEN; break;
+  case '8': r = Rank::EIGHT; break;
+  case '9': r = Rank::NINE; break;
+  case 'T': case 't': r = Rank::TEN; break;
+  case 'J': case 'j': r = Rank::JACK; break;
+  case 'Q': case 'q': r = Rank::QUEEN; break;
+  case 'K': case 'k': r = Rank::KING; break;
+  case 'A': case 'a': r = Rank::ACE; break;
+  default:  r = Rank::TWO;
   }
 
   Suit suit;
   switch (s[1]) {
-  case 'c':
-    suit = Suit::CLUBS;
-    break;
-  case 'd':
-    suit = Suit::DIAMONDS;
-    break;
-  case 'h':
-    suit = Suit::HEARTS;
-    break;
-  case 's':
-    suit = Suit::SPADES;
-    break;
-  default:
-    suit = Suit::CLUBS;
+  case 'c': suit = Suit::CLUBS; break;
+  case 'd': suit = Suit::DIAMONDS; break;
+  case 'h': suit = Suit::HEARTS; break;
+  case 's': suit = Suit::SPADES; break;
+  default:  suit = Suit::CLUBS;
   }
   return Card(r, suit);
 }
 
-std::vector<Card> parse_cards(const string &line) {
+static std::vector<Card> parse_cards_line(const string &line) {
   std::vector<Card> cards;
   std::stringstream ss(line);
   std::string item;
@@ -88,9 +61,19 @@ std::vector<Card> parse_cards(const string &line) {
   return cards;
 }
 
-// --- Solver Mode ---
+static std::vector<Card> parse_cards_json(const json &arr) {
+  std::vector<Card> out;
+  for (const auto &v : arr) {
+    out.push_back(parse_card(v.get<std::string>()));
+  }
+  return out;
+}
 
-void solver_mode(Trainer &trainer) {
+// ============================================================================
+// Interactive solver mode (preserved from original main.cpp, minus verbose UI)
+// ============================================================================
+
+static void solver_mode(Trainer &trainer) {
   RiskProfiler rp;
   EquityModule em;
   GameState game(&rp, &em);
@@ -99,269 +82,421 @@ void solver_mode(Trainer &trainer) {
 
   int num_players;
   double stack, sb, bb;
-  cout << "Number of players: ";
-  cin >> num_players;
-  cout << "Stack size: ";
-  cin >> stack;
-  cout << "Small Blind: ";
-  cin >> sb;
-  cout << "Big Blind: ";
-  cin >> bb;
+  cout << "Number of players: "; cin >> num_players;
+  cout << "Stack size: ";        cin >> stack;
+  cout << "Small Blind: ";       cin >> sb;
+  cout << "Big Blind: ";         cin >> bb;
   cin.ignore(10000, '\n');
 
   game.init_game_setup(num_players, stack, sb, bb);
 
   while (true) {
     int d_pos = -1;
-    cout << "\nEnter Dealer Position (0 to " << num_players - 1 << ") [Enter for Rotation]: ";
+    cout << "\nEnter Dealer Position (0 to " << num_players - 1
+         << ") [Enter for Rotation]: ";
     string input_pos;
     getline(cin, input_pos);
-    
     if (!input_pos.empty()) {
-      try {
-        d_pos = stoi(input_pos);
-      } catch (...) {
-        d_pos = -1;
-      }
+      try { d_pos = stoi(input_pos); } catch (...) { d_pos = -1; }
     }
 
     cout << "\n--- New Hand ---\n";
     game.start_hand(d_pos);
 
-    // 1. Preflop Input
     cout << "Enter Hero Cards (e.g. Ah Kd): ";
-    string line;
-    getline(cin, line);
-    std::vector<Card> hero_cards = parse_cards(line);
+    string line; getline(cin, line);
+    std::vector<Card> hero_cards = parse_cards_line(line);
     game.set_player_cards(0, hero_cards);
 
-    // Main Loop
     while (!game.is_terminal()) {
-      // Display State
-      cout << "\n----------------------------------------\n";
-      cout << "Stage: ";
-      switch (game.stage) {
-      case Stage::PREFLOP:
-        cout << "PREFLOP";
-        break;
-      case Stage::FLOP:
-        cout << "FLOP";
-        break;
-      case Stage::TURN:
-        cout << "TURN";
-        break;
-      case Stage::RIVER:
-        cout << "RIVER";
-        break;
-      default:
-        cout << "SHOWDOWN";
-      }
-      cout << " | Pot: " << game.pot_size << "\n";
-
-      if (!game.community_cards.empty()) {
-        cout << "Board: ";
-        for (auto &c : game.community_cards)
-          cout << c << " ";
-        cout << "\n";
-      }
-
-      // Display Equity & Stats
-      if (!hero_cards.empty()) {
-        double eq =
-            em.calculate_display_equity(hero_cards, game.community_cards);
-        cout << "Hero Equity (vs Random): " << std::fixed
-             << std::setprecision(1) << eq * 100 << "%\n";
-      }
-
-      // Display Active Player
       Player *p = game.get_current_player();
-      cout << "Action on Player " << p->id;
-      if (p->is_human)
-        cout << " (HERO)";
-      else
-        cout << " (Opponent)";
-
       double to_call = game.current_street_highest_bet - p->current_bet;
-      cout << "\n  Stack: " << std::fixed << std::setprecision(2) << p->stack;
-      cout << " | Current Bet: " << p->current_bet;
-      cout << " | To Call: " << to_call;
-      cout << " | Cumulative Bets: " << p->total_bet_size << "\n";
 
-      if (!p->is_human) {
-        cout << "  " << rp.get_formatted_stats(p->id) << "\n";
-      }
+      cout << "\n--- Stage " << (int)game.stage << " | Pot " << game.pot_size
+           << " | To call " << to_call << " ---\n";
+      cout << "Action on player " << p->id
+           << (p->is_human ? " (HERO)" : "") << "\n";
 
-      // MCCFR Recommendation (for Hero)
       if (p->is_human) {
         std::vector<double> probs;
         Action best = trainer.get_action_recommendation(game, p->id, probs);
-        std::vector<Action> legal = game.get_legal_actions();
-
-        cout << "\n*** Solver Recommendation ***\n";
-        if (!probs.empty()) {
-          // int max_idx = 0;
-          // for (size_t i = 1; i < probs.size(); ++i) {
-          //   if (probs[i] > probs[max_idx])
-          //     max_idx = i;
-          // }
-          // Action best = legal[max_idx];
-
-          cout << "Best Action: ";
-          switch (best.type) {
-          case ActionType::FOLD:
-            cout << "FOLD";
-            break;
-          case ActionType::CHECK:
-            cout << "CHECK";
-            break;
-          case ActionType::CALL:
-            cout << "CALL " << std::fixed << std::setprecision(2)
-                 << best.amount;
-            break;
-          case ActionType::BET:
-            cout << "BET " << std::fixed << std::setprecision(2) << best.amount;
-            break;
-          case ActionType::RAISE:
-            cout << "RAISE to " << std::fixed << std::setprecision(2)
-                 << best.amount;
-            break;
-          case ActionType::ALLIN:
-            cout << "ALL-IN " << std::fixed << std::setprecision(2)
-                 << best.amount;
-            break;
-          }
-          // cout << " (" << std::fixed << std::setprecision(1)
-          //      << probs[max_idx] * 100 << "%)\n";
-        } else {
-          cout << "No recommendation available (Unexplored state)\n";
-        }
+        cout << "Solver suggests: type=" << (int)best.type
+             << " amount=" << best.amount << "\n";
       }
 
-      // Input Action
-      cout << "\nActions: (f)old, (c)heck/call, (b) <amt> bet/raise, (a)llin\n";
-      cout << "Enter Action: ";
-      string action_str;
-      getline(cin, action_str);
+      cout << "Enter action (f / c / b <amt> / a): ";
+      string action_str; getline(cin, action_str);
 
       Action selected(p->id, ActionType::FOLD, 0);
       if (action_str == "f") {
         selected = Action(p->id, ActionType::FOLD);
       } else if (action_str == "c") {
-        int call_amt = game.current_street_highest_bet - p->current_bet;
-        if (call_amt == 0)
-          selected = Action(p->id, ActionType::CHECK);
-        else
-          selected = Action(p->id, ActionType::CALL, call_amt);
+        if (to_call == 0) selected = Action(p->id, ActionType::CHECK);
+        else              selected = Action(p->id, ActionType::CALL, to_call);
       } else if (action_str == "a") {
         selected = Action(p->id, ActionType::ALLIN, p->stack);
-      } else if (action_str[0] == 'b') {
+      } else if (!action_str.empty() && action_str[0] == 'b') {
         double amt = stod(action_str.substr(2));
         if (game.current_street_highest_bet == 0)
           selected = Action(p->id, ActionType::BET, amt);
         else
           selected = Action(p->id, ActionType::RAISE, amt);
       }
-
       game.apply_action(selected, false);
 
-      // Check for Street Transition
-      if (game.is_betting_round_over()) {
-        int num_folded = 0;
-        for (auto& p : game.players) {
-          if (p.is_folded)
-            num_folded += p.is_folded; 
-        }
-
-        if (game.stage == Stage::SHOWDOWN || num_folded == game.num_players - 1) {
-          cout << "Hand Over (Showdown)\n";
-          for (auto& p : game.players) {
-            cout << "Did player "
-                  << (p.id)
-                  << " win? (y/n): ";
-            string ans;
-            getline(cin, ans);
-            if (ans == "n") {
-              p.stack -= p.total_bet_size;
-              cout << "Subtracted "
-                    << (p.total_bet_size)
-                    << " from player "
-                    << (p.id)
-                    << "\n";
-              p.total_bet_size = 0;
-            }
-            else if (ans == "y") {
-              p.stack += game.pot_size;
-              cout << "Added "
-                    << (game.pot_size)
-                    << " to player "
-                    << (p.id)
-                    << "\n";
-              p.total_bet_size = 0;
-            }
-          }
-          break;
-        } else {
-          // Advance Street & Ask for Cards
-          game.next_street();
-          cout << "\nDealing "
-               << (game.stage == Stage::FLOP
-                       ? "FLOP"
-                       : (game.stage == Stage::TURN ? "TURN" : "RIVER"))
-               << "...\n";
-          cout << "Enter Board Cards: ";
-          getline(cin, line);
-          std::vector<Card> new_cards = parse_cards(line);
-          std::vector<Card> current_board = game.community_cards;
-          current_board.insert(current_board.end(), new_cards.begin(),
-                               new_cards.end());
-          game.set_community_cards(current_board);
-        }
+      if (game.is_betting_round_over() && game.stage != Stage::SHOWDOWN) {
+        game.next_street();
+        cout << "Enter board cards: ";
+        getline(cin, line);
+        auto extra = parse_cards_line(line);
+        auto board = game.community_cards;
+        board.insert(board.end(), extra.begin(), extra.end());
+        game.set_community_cards(board);
       }
     }
 
     cout << "Play another hand? (y/n): ";
-    string ans;
-    getline(cin, ans);
-    if (ans != "y")
-      break;
+    string ans; getline(cin, ans);
+    if (ans != "y") break;
   }
 }
 
-// --- Main ---
+// ============================================================================
+// JSON serve mode  (used by the benchmark harness)
+//
+// Protocol: line-delimited JSON over stdin/stdout. One request -> one response.
+//
+// Request shape (all fields required):
+//   {
+//     "player_id": 0,
+//     "num_players": 2,
+//     "dealer": 0,                  # SB sits at (dealer+1)%n in Lucy.
+//     "sb": 1.0, "bb": 2.0,
+//     "starting_stack": 200.0,
+//     "stage": "preflop|flop|turn|river",
+//     "hole":  ["Ah","Kd"],         # 2 cards; querying player's hand
+//     "board": ["..." , ...],       # 0/3/4/5 cards depending on stage
+//     "history": [                  # OpenSpiel-style action sequence in order
+//       {"player": 1, "action": 1},   # action ids match Lucy's FCPA ordering
+//       ...                            # 0=fold, 1=check/call, 2=pot, 3=allin
+//     ],
+//     "abstraction": "fcpa"
+//   }
+//
+// Response:
+//   {
+//     "ok": true,
+//     "infoset": "...",
+//     "legal_actions": [0,1,2,3],
+//     "probabilities": [p0,p1,p2,p3], # aligned with legal_actions
+//     "action": 2                      # sampled / argmax
+//   }
+//
+// Or on error: { "ok": false, "error": "<msg>" }
+// ============================================================================
+
+static const char *stage_name(Stage s) {
+  switch (s) {
+  case Stage::PREFLOP:  return "preflop";
+  case Stage::FLOP:     return "flop";
+  case Stage::TURN:     return "turn";
+  case Stage::RIVER:    return "river";
+  case Stage::SHOWDOWN: return "showdown";
+  default:              return "start";
+  }
+}
+
+// Translate a single FCPA action ID to a concrete Action object given the
+// current Lucy state. This must mirror get_legal_actions() in FCPA mode so
+// that the bet sizes used during history replay match those used at training.
+static Action fcpa_action_from_id(GameState &state, int player_id, int action_id) {
+  Player *p = state.get_player(player_id);
+  double call_amt = state.current_street_highest_bet - p->current_bet;
+  switch (action_id) {
+  case 0: return Action(player_id, ActionType::FOLD, 0);
+  case 1:
+    if (call_amt == 0) return Action(player_id, ActionType::CHECK, 0);
+    else return Action(player_id, ActionType::CALL,
+                       std::min((double)p->stack, (double)call_amt));
+  case 2: {
+    if (call_amt == 0) {
+      double pot = state.pot_size > 0 ? state.pot_size : state.big_blind_amount;
+      return Action(player_id, ActionType::BET, p->current_bet + pot);
+    } else {
+      double pot = std::max((double)state.pot_size, state.big_blind_amount);
+      double base = pot + call_amt;
+      double raise_to = state.current_street_highest_bet + base;
+      return Action(player_id, ActionType::RAISE, raise_to);
+    }
+  }
+  case 3:
+    return Action(player_id, ActionType::ALLIN, p->stack);
+  default:
+    return Action(player_id, ActionType::FOLD, 0);
+  }
+}
+
+static void deal_board_for_stage(GameState &state, Stage target,
+                                 const std::vector<Card> &board) {
+  size_t needed = 0;
+  switch (target) {
+  case Stage::PREFLOP: needed = 0; break;
+  case Stage::FLOP:    needed = 3; break;
+  case Stage::TURN:    needed = 4; break;
+  case Stage::RIVER:   needed = 5; break;
+  default:             needed = 0;
+  }
+  std::vector<Card> chosen(board.begin(),
+                           board.begin() + std::min(needed, board.size()));
+  state.set_community_cards(chosen);
+}
+
+static int serve_mode(Trainer &trainer, BettingAbstraction abs) {
+  std::cout.setf(std::ios::unitbuf);
+  std::cerr << "[lucy-serve] ready abstraction="
+            << (abs == BettingAbstraction::FCPA ? "fcpa" : "legacy")
+            << "\n";
+
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (line.empty()) continue;
+    json req;
+    try {
+      req = json::parse(line);
+    } catch (const std::exception &e) {
+      json resp = {{"ok", false}, {"error", std::string("parse: ") + e.what()}};
+      std::cout << resp.dump() << "\n";
+      continue;
+    }
+
+    try {
+      int player_id      = req.at("player_id").get<int>();
+      int num_players    = req.at("num_players").get<int>();
+      int dealer         = req.at("dealer").get<int>();
+      double sb          = req.at("sb").get<double>();
+      double bb          = req.at("bb").get<double>();
+      double starting    = req.at("starting_stack").get<double>();
+      std::string stage  = req.at("stage").get<std::string>();
+      auto hole_cards    = parse_cards_json(req.at("hole"));
+      auto board_cards   = parse_cards_json(req.at("board"));
+      const auto &hist   = req.at("history");
+
+      // Build a fresh GameState that mirrors the request.
+      EquityModule em;
+      GameState s(nullptr, &em);
+      s.betting_abstraction = abs;
+      s.init_game_setup(num_players, starting, sb, bb);
+      s.start_hand(dealer);
+
+      // Set hole cards for the *querying* player only — Lucy's info-set
+      // bucketing is hero-only.
+      s.set_player_cards(player_id, hole_cards);
+
+      Stage target_stage = Stage::PREFLOP;
+      if      (stage == "flop")  target_stage = Stage::FLOP;
+      else if (stage == "turn")  target_stage = Stage::TURN;
+      else if (stage == "river") target_stage = Stage::RIVER;
+
+      // Replay history. After each action that closes a betting round we
+      // advance the street and reveal the appropriate board prefix.
+      for (const auto &h : hist) {
+        int p_act = h.at("player").get<int>();
+        int a_id  = h.at("action").get<int>();
+        while (s.is_betting_round_over() && s.stage != Stage::SHOWDOWN
+               && s.stage != target_stage) {
+          s.next_street();
+          deal_board_for_stage(s, s.stage, board_cards);
+        }
+        Action act = fcpa_action_from_id(s, p_act, a_id);
+        s.apply_action(act, true);
+      }
+
+      while (s.is_betting_round_over() && s.stage != Stage::SHOWDOWN
+             && s.stage != target_stage) {
+        s.next_street();
+        deal_board_for_stage(s, s.stage, board_cards);
+      }
+      // Defensive: pad board to match request stage even if no transition
+      // was triggered above.
+      deal_board_for_stage(s, target_stage, board_cards);
+
+      // Look up strategy.
+      std::vector<double> probs;
+      Action best = trainer.get_action_recommendation(s, player_id, probs);
+
+      // Map Lucy's legal actions back to OpenSpiel-style FCPA IDs.
+      auto legal = s.get_legal_actions();
+      std::vector<int> legal_ids;
+      legal_ids.reserve(legal.size());
+      for (const auto &a : legal) {
+        switch (a.type) {
+        case ActionType::FOLD:  legal_ids.push_back(0); break;
+        case ActionType::CHECK:
+        case ActionType::CALL:  legal_ids.push_back(1); break;
+        case ActionType::BET:
+        case ActionType::RAISE: legal_ids.push_back(2); break;
+        case ActionType::ALLIN: legal_ids.push_back(3); break;
+        }
+      }
+
+      int chosen_id = 0;
+      switch (best.type) {
+      case ActionType::FOLD:  chosen_id = 0; break;
+      case ActionType::CHECK:
+      case ActionType::CALL:  chosen_id = 1; break;
+      case ActionType::BET:
+      case ActionType::RAISE: chosen_id = 2; break;
+      case ActionType::ALLIN: chosen_id = 3; break;
+      }
+
+      json resp = {
+        {"ok", true},
+        {"infoset", s.compute_information_set(player_id)},
+        {"legal_actions", legal_ids},
+        {"probabilities", probs},
+        {"action", chosen_id},
+        {"stage", stage_name(s.stage)},
+        {"pot", s.pot_size},
+      };
+      std::cout << resp.dump() << "\n";
+    } catch (const std::exception &e) {
+      json resp = {{"ok", false}, {"error", std::string("eval: ") + e.what()}};
+      std::cout << resp.dump() << "\n";
+    }
+  }
+  return 0;
+}
+
+// ============================================================================
+// CLI parsing
+// ============================================================================
+
+struct Args {
+  enum class Cmd { NONE, TRAIN, SERVE, INTERACTIVE } cmd = Cmd::NONE;
+  int iterations = 0;
+  int players = 2;
+  unsigned seed = 0;
+  std::string out_path = "poker_model.dat";
+  std::string in_path  = "poker_model.dat";
+  BettingAbstraction abstraction = BettingAbstraction::LEGACY;
+  bool randomize_config = false;
+  double stack_bb = 100.0;
+  double sb = 1.0;
+  double bb = 2.0;
+  int batch_size = 64;
+};
+
+static void print_usage() {
+  std::cerr <<
+    "PokerBotMAIF — Lucy MCCFR poker solver\n"
+    "Usage:\n"
+    "  PokerBotMAIF --train <iters> [options]    Train a model\n"
+    "  PokerBotMAIF --serve <model_path> [opts]  JSON IPC strategy server\n"
+    "  PokerBotMAIF --interactive                Original interactive mode\n"
+    "  PokerBotMAIF                              (deprecated) menu mode\n"
+    "\n"
+    "Options:\n"
+    "  --players N            Number of players (default 2)\n"
+    "  --seed N               PRNG seed (0 = nondeterministic)\n"
+    "  --out PATH             Save model to PATH (train mode)\n"
+    "  --abstraction MODE     legacy|fcpa  (default legacy)\n"
+    "  --randomize-config     Use legacy randomized stack/players sampling\n"
+    "  --stack-bb N           Fixed stack size in BB (default 100)\n"
+    "  --sb N                 Small blind chips (default 1)\n"
+    "  --bb N                 Big blind chips (default 2)\n"
+    "  --batch-size N         Trainer flush cadence (default 64)\n"
+    "\n";
+}
+
+static Args parse_args(int argc, char **argv) {
+  Args a;
+  for (int i = 1; i < argc; ++i) {
+    std::string s = argv[i];
+    auto next = [&](const char *flag) -> std::string {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << flag << "\n";
+        std::exit(2);
+      }
+      return argv[++i];
+    };
+    if (s == "--train") {
+      a.cmd = Args::Cmd::TRAIN;
+      a.iterations = std::stoi(next("--train"));
+    } else if (s == "--serve") {
+      a.cmd = Args::Cmd::SERVE;
+      a.in_path = next("--serve");
+    } else if (s == "--interactive") {
+      a.cmd = Args::Cmd::INTERACTIVE;
+    } else if (s == "--players")    a.players = std::stoi(next("--players"));
+    else if (s == "--seed")         a.seed = (unsigned)std::stoul(next("--seed"));
+    else if (s == "--out")          a.out_path = next("--out");
+    else if (s == "--abstraction") {
+      std::string v = next("--abstraction");
+      if (v == "fcpa")        a.abstraction = BettingAbstraction::FCPA;
+      else if (v == "legacy") a.abstraction = BettingAbstraction::LEGACY;
+      else { std::cerr << "unknown abstraction: " << v << "\n"; std::exit(2); }
+    }
+    else if (s == "--randomize-config") a.randomize_config = true;
+    else if (s == "--stack-bb")     a.stack_bb = std::stod(next("--stack-bb"));
+    else if (s == "--sb")           a.sb = std::stod(next("--sb"));
+    else if (s == "--bb")           a.bb = std::stod(next("--bb"));
+    else if (s == "--batch-size")   a.batch_size = std::stoi(next("--batch-size"));
+    else if (s == "-h" || s == "--help") { print_usage(); std::exit(0); }
+    else {
+      std::cerr << "unknown arg: " << s << "\n"; print_usage(); std::exit(2);
+    }
+  }
+  return a;
+}
+
+// ============================================================================
+// main
+// ============================================================================
 
 int main(int argc, char *argv[]) {
-  // Dummy GameState for Trainer init (will be replaced in solver_mode)
+  Args a = parse_args(argc, argv);
+
   RiskProfiler rp;
   EquityModule em;
   GameState game(&rp, &em);
+  game.betting_abstraction = a.abstraction;
   Trainer trainer(&game);
+  trainer.set_batch_size(a.batch_size);
 
-  if (argc == 3 && string(argv[1]) == "--train") {
-    int iterations = atoi(argv[2]);
-    cout << "Training " << iterations << " iterations...\n";
-    trainer.train(iterations);
-    trainer.save_to_file("poker_model.dat");
+  if (a.cmd == Args::Cmd::TRAIN) {
+    auto t0 = std::chrono::steady_clock::now();
+    trainer.train(a.iterations, a.players, a.seed, a.abstraction,
+                  a.randomize_config, a.stack_bb, a.sb, a.bb);
+    auto t1 = std::chrono::steady_clock::now();
+    auto secs = std::chrono::duration<double>(t1 - t0).count();
+    std::cerr << "[lucy] elapsed " << std::fixed << std::setprecision(2)
+              << secs << "s\n";
+    trainer.save_to_file(a.out_path);
+    std::cerr << "[lucy] saved -> " << a.out_path << "\n";
     return 0;
   }
 
-  cout << "1. Train MCCFR\n";
-  cout << "2. Solver Mode (Manual Input)\n";
-  cout << "Select: ";
-  int choice;
-  cin >> choice;
-  cin.ignore(10000, '\n');
-
-  if (choice == 1) {
-    int iter;
-    cout << "Iterations: ";
-    cin >> iter;
-    trainer.train(iter);
-    trainer.save_to_file("poker_model.dat");
-  } else {
-    // Try load model
-    trainer.load_from_file("poker_model.dat");
-    solver_mode(trainer);
+  if (a.cmd == Args::Cmd::SERVE) {
+    trainer.load_from_file(a.in_path);
+    return serve_mode(trainer, a.abstraction);
   }
 
+  if (a.cmd == Args::Cmd::INTERACTIVE) {
+    trainer.load_from_file(a.in_path);
+    solver_mode(trainer);
+    return 0;
+  }
+
+  // Legacy menu (back-compat with original main).
+  cout << "1. Train MCCFR\n2. Solver Mode\nSelect: ";
+  int choice; cin >> choice; cin.ignore(10000, '\n');
+  if (choice == 1) {
+    int iter; cout << "Iterations: "; cin >> iter;
+    trainer.train(iter, a.players, a.seed, a.abstraction);
+    trainer.save_to_file(a.out_path);
+  } else {
+    trainer.load_from_file(a.in_path);
+    solver_mode(trainer);
+  }
   return 0;
 }

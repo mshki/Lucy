@@ -82,40 +82,56 @@ void Trainer::deal_random_community_cards(GameState &state, int num_cards,
   }
 }
 
-void Trainer::train(int iterations, int /*num_players*/) {
+void Trainer::train(int iterations, int num_players, unsigned seed,
+                    BettingAbstraction abs, bool randomize_config,
+                    double stack_bb_arg, double sb_arg, double bb_arg) {
   if (!game) {
     return;
   }
 
-  std::random_device rd;
-  std::mt19937 gen(rd());
+  std::mt19937 gen;
+  if (seed != 0) {
+    gen.seed(seed);
+  } else {
+    std::random_device rd;
+    gen.seed(rd());
+  }
 
-  // Configuration options for sampling
+  // Configuration options for legacy randomized sampling.
   std::vector<int> player_counts = {2, 3, 4, 5, 6};
   std::vector<double> stack_bb_options = {10, 25, 50, 100, 200};
 
   int batched_traversals = 0;
+  int log_every = std::max(1, iterations / 20);
 
   for (int i = 0; i < iterations; ++i) {
 
-    if (i % 100 == 0) {
-      std::cout << "Iteration " << i << "/" << iterations
-                << " — nodes=" << node_matrix_.num_nodes() << "\n";
+    if (i == 0 || i % log_every == 0) {
+      std::cout << "[lucy] iter " << i << "/" << iterations
+                << " nodes=" << node_matrix_.num_nodes() << std::endl;
     }
 
-    // Randomly sample configuration
-    int sampled_players = player_counts[gen() % player_counts.size()];
-    double stack_bb = stack_bb_options[gen() % stack_bb_options.size()];
-
-    sampled_players = 5;
-    // Fixed blinds (abstraction normalizes anyway)
-    double bb = 2.0;
-    double sb = 1.0;
+    int sampled_players;
+    double stack_bb, sb, bb;
+    if (randomize_config) {
+      // Legacy behavior: sample players and stack each iteration.
+      sampled_players = num_players > 0 ? num_players : 5;
+      stack_bb = stack_bb_options[gen() % stack_bb_options.size()];
+      sb = 1.0;
+      bb = 2.0;
+    } else {
+      // Benchmark mode: fixed config every iteration.
+      sampled_players = num_players;
+      stack_bb = stack_bb_arg;
+      sb = sb_arg;
+      bb = bb_arg;
+    }
     double stack = stack_bb * bb;
 
     // External sampling: traverse from each player's perspective
     for (int traverser = 0; traverser < sampled_players; ++traverser) {
       GameState s(nullptr, game->equity_module);
+      s.betting_abstraction = abs;
       s.init_game_setup(sampled_players, stack, sb, bb);
       s.start_hand();
       deal_random_hole_cards(s, gen);
@@ -135,7 +151,8 @@ void Trainer::train(int iterations, int /*num_players*/) {
     node_matrix_.flush();
   }
 
-  std::cout << "Training complete: " << iterations << " iterations\n";
+  std::cout << "[lucy] training complete: " << iterations << " iterations, "
+            << node_matrix_.num_nodes() << " infosets\n";
 }
 
 std::vector<double> Trainer::calculate_payoffs(GameState &state) {

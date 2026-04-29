@@ -52,7 +52,16 @@ public:
 
   void set_batch_size(int n) { batch_size_ = n > 0 ? n : 1; }
 
-  void train(int iterations, int num_players = 2);
+  // Train with a fixed configuration suitable for benchmarking against an
+  // external solver. Set `randomize_config=false` for reproducible benchmarks
+  // where every iteration uses the same (num_players, stack, blinds, abs).
+  // A non-zero `seed` makes the run deterministic.
+  void train(int iterations, int num_players = 2, unsigned seed = 0,
+             BettingAbstraction abs = BettingAbstraction::LEGACY,
+             bool randomize_config = true,
+             double stack_bb = 100.0,
+             double sb = 1.0,
+             double bb = 2.0);
 
   std::vector<double> get_strategy(const std::string &info_set);
 

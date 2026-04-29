@@ -22,6 +22,16 @@ enum class Stage {
 
 enum class ActionType { FOLD, CHECK, CALL, BET, RAISE, ALLIN };
 
+// Betting tree abstraction.
+//   LEGACY: Lucy's original 5-bet-size abstraction
+//           {fold, check/call, 0.33p, 0.66p, 1p, 2p, allin}
+//   FCPA:   research-standard 4-action abstraction matching OpenSpiel's
+//           universal_poker bettingAbstraction=fcpa
+//           {fold, check/call, pot-sized bet/raise, all-in}
+// Action ordering in FCPA mode preserves OpenSpiel's stable IDs:
+//   0 = FOLD, 1 = CHECK/CALL, 2 = POT, 3 = ALLIN
+enum class BettingAbstraction { LEGACY, FCPA };
+
 // Minimal player struct for MCCFR
 struct Player {
   int id;
@@ -72,6 +82,7 @@ struct GameState {
 
   Stage stage;
   StateType type;
+  BettingAbstraction betting_abstraction = BettingAbstraction::LEGACY;
 
   GameState(RiskProfiler *rp, EquityModule *em);
 

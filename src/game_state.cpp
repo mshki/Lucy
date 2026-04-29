@@ -121,8 +121,14 @@ void GameState::next_street() {
   else if (stage == Stage::RIVER)
     stage = Stage::SHOWDOWN;
 
-  // Reset action to left of dealer (SB)
-  current_player_index = (dealer_index + 1) % num_players;
+  // Reset action: in HU NLHE the BB acts first postflop; in 3+ player games
+  // the SB (= player to the left of the dealer) acts first.
+  if (num_players == 2) {
+    // BB sits at (dealer+2) % 2 == dealer position in Lucy's blinds layout.
+    current_player_index = dealer_index;
+  } else {
+    current_player_index = (dealer_index + 1) % num_players;
+  }
 
   // Skip folded/all-in players
   int attempts = 0;
@@ -410,6 +416,45 @@ std::vector<Action> GameState::get_legal_actions() {
   Player *p = get_current_player();
   int call_amt = current_street_highest_bet - p->current_bet;
 
+  // ---- FCPA abstraction (matches OpenSpiel universal_poker fcpa) ----
+  // OpenSpiel action IDs are stable across states:
+  //   0 = FOLD, 1 = CHECK/CALL, 2 = POT-sized bet/raise, 3 = ALLIN
+  // Fold is illegal when there is no bet to call (matches OpenSpiel).
+  if (betting_abstraction == BettingAbstraction::FCPA) {
+    if (call_amt > 0) {
+      actions.emplace_back(p->id, ActionType::FOLD, 0);
+    }
+
+    if (call_amt == 0) {
+      actions.emplace_back(p->id, ActionType::CHECK, 0);
+    } else {
+      double call = std::min((double)p->stack, (double)call_amt);
+      actions.emplace_back(p->id, ActionType::CALL, call);
+    }
+
+    if (call_amt == 0) {
+      double pot = pot_size > 0 ? pot_size : big_blind_amount;
+      double add = pot;
+      if (add > 0 && add < p->stack) {
+        actions.emplace_back(p->id, ActionType::BET, p->current_bet + add);
+      }
+    } else {
+      double pot = std::max((double)pot_size, big_blind_amount);
+      double base = pot + call_amt;
+      double raise_to = current_street_highest_bet + base;
+      if (raise_to > current_street_highest_bet &&
+          (raise_to - p->current_bet) < p->stack) {
+        actions.emplace_back(p->id, ActionType::RAISE, raise_to);
+      }
+    }
+
+    if (p->stack > 0) {
+      actions.emplace_back(p->id, ActionType::ALLIN, p->stack);
+    }
+    return actions;
+  }
+
+  // ---- LEGACY abstraction (original behavior) ----
   actions.emplace_back(p->id, ActionType::FOLD, 0);
 
   if (call_amt == 0) {
