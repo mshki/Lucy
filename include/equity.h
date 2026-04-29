@@ -69,6 +69,10 @@ public:
   int bucketize_hand(const std::vector<Card> &hero_hand,
                      const std::vector<Card> &board_cards, street street);
 
+  // Canonical suit-isomorphic signature for information sets
+  std::string canonical_state_signature(const std::vector<Card> &hero_hand,
+                                        const std::vector<Card> &board_cards) const;
+
   // Hand evaluation helper
   int evaluate_7_cards(const std::vector<Card> &cards);
 

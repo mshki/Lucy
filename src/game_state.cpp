@@ -289,6 +289,12 @@ string GameState::compute_information_set(int player_id) {
     bucket = equity_module->bucketize_hand(p->hole_cards, community_cards, st);
   }
 
+  std::string suit_signature = "_";
+  if (equity_module && p->hole_cards.size() >= 2) {
+    suit_signature =
+        equity_module->canonical_state_signature(p->hole_cards, community_cards);
+  }
+
   // for (auto c : p->hole_cards) {
   //   info += c.to_string();
   // }
@@ -303,6 +309,7 @@ string GameState::compute_information_set(int player_id) {
   // }
   
   info += std::to_string(bucket) + "|";
+  info += suit_signature + "|";
   info += std::to_string((int)stage) + "|";
 
   // ABSTRACTION: Normalize to big blinds
