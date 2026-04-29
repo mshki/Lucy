@@ -7,4 +7,5 @@ build/
 *.sh
 *.lldb
 *.gz
-.claude/
+.claude/__pycache__/
+*.pyc
