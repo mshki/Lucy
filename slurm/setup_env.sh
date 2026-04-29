@@ -25,29 +25,50 @@ echo "[setup] LUCY_BENCH    = $LUCY_BENCH_ROOT"
 echo "[setup] ENV_PREFIX    = $ENV_PREFIX"
 echo "[setup] PY_VER        = $PY_VER"
 
-# 1. Unity modules ----------------------------------------------------------
+# 1. Locate a Python with venv. Prefer Lmod's python module (pre-built on
+# Unity, with a sane site layout), fall back to system /usr/bin/python3.
+SYSTEM_PYTHON=""
 if command -v module >/dev/null 2>&1; then
-  module load conda/latest || true
+  for cand in "python/$PY_VER" "python/3.11.7" "python/3.10.14" "python/3.12.3"; do
+    if module load "$cand" 2>/dev/null; then
+      SYSTEM_PYTHON="$(command -v python3)"
+      echo "[setup] using module $cand -> $SYSTEM_PYTHON"
+      break
+    fi
+  done
+fi
+if [[ -z "$SYSTEM_PYTHON" ]]; then
+  SYSTEM_PYTHON="$(command -v python3 || true)"
+  echo "[setup] fallback python: $SYSTEM_PYTHON"
+fi
+if [[ -z "$SYSTEM_PYTHON" ]]; then
+  echo "[setup] FATAL: no python3 found" >&2; exit 1
 fi
 
-# 2. Conda env --------------------------------------------------------------
-if [[ ! -d "$ENV_PREFIX" ]]; then
-  echo "[setup] creating conda env at $ENV_PREFIX"
+# 2. venv  -----------------------------------------------------------------
+# venv is much faster than conda on shared filesystems (no transaction phase).
+if [[ ! -x "$ENV_PREFIX/bin/pip" ]]; then
+  if [[ -d "$ENV_PREFIX" ]]; then
+    echo "[setup] env exists but is incomplete — recreating"
+    rm -rf "$ENV_PREFIX"
+  fi
   mkdir -p "$(dirname "$ENV_PREFIX")"
-  conda create --yes --prefix "$ENV_PREFIX" "python=$PY_VER" pip
+  echo "[setup] creating venv at $ENV_PREFIX"
+  "$SYSTEM_PYTHON" -m venv "$ENV_PREFIX"
 else
-  echo "[setup] conda env already exists, skipping create"
+  echo "[setup] venv already complete, skipping create"
 fi
 
-# Activate via path (works both inside/outside conda init).
-# shellcheck disable=SC1091
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$ENV_PREFIX"
+PY="$ENV_PREFIX/bin/python"
+PIP="$ENV_PREFIX/bin/pip"
+if [[ ! -x "$PY" ]]; then
+  echo "[setup] FATAL: $PY missing — venv create failed" >&2; exit 1
+fi
 
 # 3. Python deps ------------------------------------------------------------
-echo "[setup] installing python deps"
-pip install --upgrade pip
-pip install "open_spiel>=1.6.10" numpy matplotlib
+echo "[setup] installing python deps via $PIP"
+"$PIP" install --upgrade pip
+"$PIP" install "open_spiel>=1.6.10" numpy matplotlib
 
 # 4. Build both Lucy variants -----------------------------------------------
 build_variant() {
@@ -81,7 +102,7 @@ mkdir -p "$LUCY_BENCH_ROOT/models" "$LUCY_BENCH_ROOT/results" "$LUCY_BENCH_ROOT/
 
 echo
 echo "[setup] done. To activate the env in any future shell:"
-echo "  module load conda/latest && conda activate $ENV_PREFIX"
+echo "  source $ENV_PREFIX/bin/activate"
 echo
 echo "[setup] quick smoke check:"
-python -c "import pyspiel, numpy; print('pyspiel', pyspiel.__name__, 'numpy', numpy.__version__)" || true
+"$PY" -c "import pyspiel, numpy; print('pyspiel ok, numpy', numpy.__version__)" || true

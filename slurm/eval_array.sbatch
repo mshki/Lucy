@@ -38,18 +38,15 @@ SEED=${SEEDS[$SEED_IDX]}
 LUCY_BENCH_ROOT="${LUCY_BENCH_ROOT:-$(pwd)}"
 cd "$LUCY_BENCH_ROOT"
 
-if command -v module >/dev/null 2>&1; then
-  module load conda/latest || true
-fi
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LUCY_BENCH_ROOT/envs/lucy"
+# Activate the venv built by slurm/setup_env.sh
+# shellcheck disable=SC1091
+source "$LUCY_BENCH_ROOT/envs/lucy/bin/activate"
 
 case "$VARIANT" in
-  lucy-legacy) BUILD_DIR="$LUCY_BENCH_ROOT/build-legacy" ;;
-  lucy-cuda)   BUILD_DIR="$LUCY_BENCH_ROOT/build-cuda" ;;
+  lucy-legacy) LUCY_BIN="$LUCY_BENCH_ROOT/lucy-legacy/build/bin/PokerBotMAIF" ;;
+  lucy-cuda)   LUCY_BIN="$LUCY_BENCH_ROOT/lucy-cuda/build/bin/PokerBotMAIF" ;;
   *) echo "[eval] unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
-LUCY_BIN="$BUILD_DIR/bin/PokerBotMAIF"
 
 LUCY_MODEL="$LUCY_BENCH_ROOT/models/$VARIANT/iters=${ITERS}/seed=${SEED}.dat"
 OS_MODEL="$LUCY_BENCH_ROOT/models/openspiel/iters=${ITERS}/seed=${SEED}.pkl"

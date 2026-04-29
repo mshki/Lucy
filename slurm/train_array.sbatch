@@ -42,11 +42,9 @@ SEED=${SEEDS[$SEED_IDX]}
 LUCY_BENCH_ROOT="${LUCY_BENCH_ROOT:-$(pwd)}"
 cd "$LUCY_BENCH_ROOT"
 
-if command -v module >/dev/null 2>&1; then
-  module load conda/latest || true
-fi
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LUCY_BENCH_ROOT/envs/lucy"
+# Activate the venv built by slurm/setup_env.sh
+# shellcheck disable=SC1091
+source "$LUCY_BENCH_ROOT/envs/lucy/bin/activate"
 
 # ---------- Dispatch ----------
 echo "[train] task=$TASK variant=$VARIANT iters=$ITERS seed=$SEED"
@@ -54,7 +52,7 @@ echo "[train] node=$(hostname) cpus=$SLURM_CPUS_PER_TASK"
 
 case "$VARIANT" in
   lucy-legacy)
-    BIN="$LUCY_BENCH_ROOT/build-legacy/bin/PokerBotMAIF"
+    BIN="$LUCY_BENCH_ROOT/lucy-legacy/build/bin/PokerBotMAIF"
     OUT="$LUCY_BENCH_ROOT/models/lucy-legacy/iters=${ITERS}/seed=${SEED}.dat"
     mkdir -p "$(dirname "$OUT")"
     echo "[train] running $BIN --train $ITERS --seed $SEED ..."
@@ -66,7 +64,7 @@ case "$VARIANT" in
       --out "$OUT"
     ;;
   lucy-cuda)
-    BIN="$LUCY_BENCH_ROOT/build-cuda/bin/PokerBotMAIF"
+    BIN="$LUCY_BENCH_ROOT/lucy-cuda/build/bin/PokerBotMAIF"
     OUT="$LUCY_BENCH_ROOT/models/lucy-cuda/iters=${ITERS}/seed=${SEED}.dat"
     mkdir -p "$(dirname "$OUT")"
     echo "[train] running $BIN --train $ITERS --seed $SEED ..."
