@@ -10,6 +10,18 @@
 
 using InfoSetKey = std::string;
 
+// MCCFR sampling scheme.
+//   ExternalSampling — at traverser nodes, enumerate all actions; at
+//                      opponent nodes and chance, sample one. Lower-variance
+//                      regret estimates per traversal but cost grows with
+//                      |A| at every traverser node. Lucy's original mode.
+//   OutcomeSampling  — at every node (chance, traverser, opponent) sample
+//                      one action; importance-weight the regret + strategy
+//                      updates. Cheaper per traversal, higher variance.
+//                      Matches OpenSpiel's `OutcomeSamplingMCCFRSolver` for
+//                      apples-to-apples benchmarking.
+enum class SamplerType { ExternalSampling, OutcomeSampling };
+
 class Trainer {
 private:
   GameState *game;
@@ -28,10 +40,24 @@ private:
   NodeMatrix node_matrix_;
   std::unordered_map<InfoSetKey, int> info_to_id_;
   int batch_size_ = kDefaultBatchSize;
+  SamplerType sampler_ = SamplerType::ExternalSampling;
+  double outcome_epsilon_ = 0.6; // OpenSpiel's default
 
   double cfr(GameState &state, int player_id, double prob_traverser,
              std::vector<double> &reach, double prob_chance, std::mt19937 &gen,
              int depth = 0);
+
+  // Outcome-sampling MCCFR (Lanctot et al. 2009; OpenSpiel reference impl
+  // at algorithms/outcome_sampling_mccfr.cc). Returns the importance-
+  // weighted utility for `traverser` along the sampled trajectory.
+  // Sampling distribution at the traverser's nodes is epsilon-greedy:
+  //   sigma'(I,a) = epsilon/|A| + (1-epsilon) * sigma(I,a)
+  // Opponent and chance nodes sample directly from sigma (or chance prob).
+  // Regrets are updated only at traverser nodes; strategy_sum is updated at
+  // all player nodes (chance does not have an info-set).
+  double cfr_outcome(GameState &state, int traverser,
+                     std::vector<double> &reach, double sample_reach,
+                     std::mt19937 &gen, int depth, double epsilon);
 
   std::vector<double> calculate_payoffs(GameState &state);
 
@@ -51,6 +77,8 @@ public:
   ~Trainer();
 
   void set_batch_size(int n) { batch_size_ = n > 0 ? n : 1; }
+  void set_sampler(SamplerType s) { sampler_ = s; }
+  void set_outcome_epsilon(double e) { outcome_epsilon_ = e; }
 
   // Train with a fixed configuration suitable for benchmarking against an
   // external solver. Set `randomize_config=false` for reproducible benchmarks

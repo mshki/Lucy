@@ -384,6 +384,9 @@ struct Args {
   double sb = 1.0;
   double bb = 2.0;
   int batch_size = 64;
+  // MCCFR sampler — "external" or "outcome".
+  std::string sampler = "external";
+  double outcome_epsilon = 0.6;
 };
 
 static void print_usage() {
@@ -405,6 +408,8 @@ static void print_usage() {
     "  --sb N                 Small blind chips (default 1)\n"
     "  --bb N                 Big blind chips (default 2)\n"
     "  --batch-size N         Trainer flush cadence (default 64)\n"
+    "  --sampler S            MCCFR sampler: external|outcome  (default external)\n"
+    "  --outcome-epsilon E    Exploration mixing for outcome-sampling (default 0.6)\n"
     "\n";
 }
 
@@ -441,6 +446,8 @@ static Args parse_args(int argc, char **argv) {
     else if (s == "--sb")           a.sb = std::stod(next("--sb"));
     else if (s == "--bb")           a.bb = std::stod(next("--bb"));
     else if (s == "--batch-size")   a.batch_size = std::stoi(next("--batch-size"));
+    else if (s == "--sampler")      a.sampler = next("--sampler");
+    else if (s == "--outcome-epsilon") a.outcome_epsilon = std::stod(next("--outcome-epsilon"));
     else if (s == "-h" || s == "--help") { print_usage(); std::exit(0); }
     else {
       std::cerr << "unknown arg: " << s << "\n"; print_usage(); std::exit(2);
@@ -462,6 +469,13 @@ int main(int argc, char *argv[]) {
   game.betting_abstraction = a.abstraction;
   Trainer trainer(&game);
   trainer.set_batch_size(a.batch_size);
+  if (a.sampler == "external") trainer.set_sampler(SamplerType::ExternalSampling);
+  else if (a.sampler == "outcome") trainer.set_sampler(SamplerType::OutcomeSampling);
+  else {
+    std::cerr << "unknown --sampler: " << a.sampler << "\n";
+    return 2;
+  }
+  trainer.set_outcome_epsilon(a.outcome_epsilon);
 
   if (a.cmd == Args::Cmd::TRAIN) {
     auto t0 = std::chrono::steady_clock::now();
