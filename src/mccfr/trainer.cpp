@@ -102,6 +102,7 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
   std::vector<double> stack_bb_options = {10, 25, 50, 100, 200};
 
   int batched_traversals = 0;
+  int flush_count = 0;
   int log_every = std::max(1, iterations / 20);
 
   for (int i = 0; i < iterations; ++i) {
@@ -140,7 +141,8 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
       cfr(s, traverser, 1.0, reach, 1.0, gen, 0);
 
       if (++batched_traversals >= batch_size_) {
-        node_matrix_.flush();
+        ++flush_count;
+        node_matrix_.flush(flush_count, dcfr_);
         batched_traversals = 0;
       }
     }
@@ -148,7 +150,8 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
 
   // Final flush so any leftover deltas land in the strategy_sum.
   if (batched_traversals > 0) {
-    node_matrix_.flush();
+    ++flush_count;
+    node_matrix_.flush(flush_count, dcfr_);
   }
 
   std::cout << "[lucy] training complete: " << iterations << " iterations, "

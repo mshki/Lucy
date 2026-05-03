@@ -1,6 +1,7 @@
 #ifndef NODE_MATRIX_H
 #define NODE_MATRIX_H
 
+#include "cuda/cuda_kernels.h"
 #include <vector>
 
 // Dense N x K host-side buffer for MCCFR info-set state. During a batch of CFR
@@ -29,7 +30,10 @@ public:
   void accumulate_realization_weight(int id, double weight);
 
   // Apply all pending deltas and weights, refresh the strategy cache.
-  void flush();
+  // `iteration` and `dcfr` drive the Discounted CFR update; with the
+  // default DcfrParams (alpha=∞, beta=∞, gamma=0) the call reduces to
+  // vanilla CFR, bit-exact.
+  void flush(int iteration = 1, DcfrParams dcfr = {1e30, 1e30, 0.0});
 
   // Per-node average strategy from strategy_sum (for inference / save).
   std::vector<double> average_strategy(int id) const;

@@ -384,6 +384,9 @@ struct Args {
   double sb = 1.0;
   double bb = 2.0;
   int batch_size = 64;
+  // CFR variant — drives DcfrParams.
+  // "vanilla" (CFR), "linear" (Linear CFR), "plus" (CFR+), "dcfr" (default).
+  std::string cfr_variant = "vanilla";
 };
 
 static void print_usage() {
@@ -405,6 +408,7 @@ static void print_usage() {
     "  --sb N                 Small blind chips (default 1)\n"
     "  --bb N                 Big blind chips (default 2)\n"
     "  --batch-size N         Trainer flush cadence (default 64)\n"
+    "  --cfr-variant V        vanilla|linear|plus|dcfr  (default vanilla)\n"
     "\n";
 }
 
@@ -441,6 +445,7 @@ static Args parse_args(int argc, char **argv) {
     else if (s == "--sb")           a.sb = std::stod(next("--sb"));
     else if (s == "--bb")           a.bb = std::stod(next("--bb"));
     else if (s == "--batch-size")   a.batch_size = std::stoi(next("--batch-size"));
+    else if (s == "--cfr-variant")  a.cfr_variant = next("--cfr-variant");
     else if (s == "-h" || s == "--help") { print_usage(); std::exit(0); }
     else {
       std::cerr << "unknown arg: " << s << "\n"; print_usage(); std::exit(2);
@@ -462,6 +467,20 @@ int main(int argc, char *argv[]) {
   game.betting_abstraction = a.abstraction;
   Trainer trainer(&game);
   trainer.set_batch_size(a.batch_size);
+  // Map the --cfr-variant string to DcfrParams.
+  // (alpha, beta, gamma):
+  //   vanilla → (∞, ∞, 0)   no discount
+  //   linear  → (∞, ∞, 1)   linear strategy averaging
+  //   plus    → (∞, -∞, 1)  CFR+ (clamp negative regrets, linear avg)
+  //   dcfr    → (1.5, 0, 2) Brown & Sandholm 2019 default
+  if (a.cfr_variant == "vanilla") trainer.set_dcfr({1e30, 1e30, 0.0});
+  else if (a.cfr_variant == "linear") trainer.set_dcfr({1e30, 1e30, 1.0});
+  else if (a.cfr_variant == "plus") trainer.set_dcfr({1e30, -1e30, 1.0});
+  else if (a.cfr_variant == "dcfr") trainer.set_dcfr({1.5, 0.0, 2.0});
+  else {
+    std::cerr << "unknown --cfr-variant: " << a.cfr_variant << "\n";
+    return 2;
+  }
 
   if (a.cmd == Args::Cmd::TRAIN) {
     auto t0 = std::chrono::steady_clock::now();
