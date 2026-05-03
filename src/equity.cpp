@@ -1,10 +1,37 @@
+// Lucy hand evaluation + bucketing.
+//
+// As of feat/fast-evaluator the 5/7-card evaluator is backed by OMPEval
+// (zekyll/OMPEval, ISC) — a 200KB perfect-hash table that returns a 16-bit
+// total ordering at ~270M evals/sec. The pre-existing brute-force
+// `evaluate_5_cards` (sort+set+map+next_permutation, ~µs/eval) and the
+// O(C(7,5)=21) wrapper around it have been deleted; their public API is
+// preserved by thin OMP wrappers below.
+//
+// Return value semantics: evaluate_5_cards / evaluate_7_cards return OMP's
+// raw rank value. Higher is strictly better. Category can be extracted by
+// dividing by 4096 (1=high card, 2=pair, ..., 9=straight flush). The old
+// 0x100000-stride encoding is gone — bucketize_hand has been migrated.
+//
+// CHANGELOG:
+//   - DELETED: brute-force evaluate_5_cards (replaced by OMP perfect-hash)
+//   - DELETED: 21-subset next_permutation enumerator (OMP evaluates 7-card
+//              hands in a single 64-bit-add + LUT chain)
+//   - DELETED: std::set<Rank> royals / std::map<Rank,int> counts machinery
+//   - CHANGED: bucketize_hand thresholds migrated from 0xN00000 to N*4096
+//              (lossless because OMP gives us strictly more information)
+//   - CHANGED: calculate_display_equity now uses OMP evaluator at the inner
+//              loop. Iteration count remains 1000 (Monte Carlo) — call
+//              omp::EquityCalculator directly for true range-vs-range.
+
 #include "../include/equity.h"
+#include "../include/external/omp/HandEvaluator.h"
+#include "../include/external/omp/Hand.h"
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <map>
 #include <random>
-#include <set>
 
 namespace {
 
@@ -13,119 +40,47 @@ char rank_to_char(Rank rank) {
   return ranks[rank];
 }
 
+// OMPEval encodes a card as `4 * rank + suit` with rank in [0..12]
+// (deuce..ace) and suit in [0..3]. Lucy's `Card{rank, suit}` uses identical
+// integer ranges; only the symbolic *meaning* of suit differs (we call
+// 0=clubs whereas OMP calls 0=spade), but evaluation depends only on
+// equality of suit numbers, not their labels — so the conversion is direct.
+inline unsigned to_omp_card_id(const Card &c) {
+  return static_cast<unsigned>(c.rank) * 4u + static_cast<unsigned>(c.suit);
+}
+
+inline omp::Hand to_omp_hand(const std::vector<Card> &cards) {
+  omp::Hand h = omp::Hand::empty();
+  for (const auto &c : cards) {
+    h += omp::Hand(to_omp_card_id(c));
+  }
+  return h;
+}
+
+// Singleton evaluator: the static LUTs init in HandEvaluator()'s ctor cost
+// ~10 ms; do it once per process.
+const omp::HandEvaluator &evaluator() {
+  static const omp::HandEvaluator E;
+  return E;
+}
+
+// OMP value -> hand category (1..9).
+inline int omp_category(uint16_t v) { return v >> 12; }
+
 } // namespace
 
-// --- Internal Hand Evaluation Logic ---
-
-// Helper to sort cards by rank descending
 bool compareCards(const Card &a, const Card &b) { return a.rank > b.rank; }
 
 int EquityModule::evaluate_5_cards(const std::vector<Card> &cards) {
   if (cards.size() != 5)
     return 0;
-
-  std::vector<Card> sorted = cards;
-  std::sort(sorted.begin(), sorted.end(), compareCards);
-
-  bool flush = true;
-  for (size_t i = 1; i < 5; ++i) {
-    if (sorted[i].suit != sorted[0].suit) {
-      flush = false;
-      break;
-    }
-  }
-
-  bool straight = true;
-  bool royal = true;
-  std::set<Rank> royals = {Rank::TEN, 
-                            Rank::JACK,
-                            Rank::QUEEN,
-                            Rank::KING,
-                            Rank::ACE};
-  for (size_t i = 0; i < 4; ++i) {
-    if (sorted[i].rank != sorted[i + 1].rank + 1) {
-      straight = false;
-      break;
-    }
-    if (royals.find(sorted[i].rank) == royals.end()) {
-      royal = false;
-    }
-  }
-  // Wheel case: A 5 4 3 2
-  if (!straight && sorted[0].rank == Rank::ACE &&
-      sorted[1].rank == Rank::FIVE && sorted[2].rank == Rank::FOUR &&
-      sorted[3].rank == Rank::THREE && sorted[4].rank == Rank::TWO) {
-    straight = true;
-  }
-
-  if (flush && straight) {
-    if (sorted[0].rank == Rank::ACE && sorted[1].rank == Rank::KING)
-      return 0x900000;                // Royal
-    return 0x800000 + sorted[0].rank; // Straight Flush
-  }
-
-  std::map<Rank, int> counts;
-  for (const auto &c : sorted)
-    counts[c.rank]++;
-
-  bool four_kind = false;
-  bool three_kind = false;
-  int pairs = 0;
-
-  for (auto const &[rank, count] : counts) {
-    if (count == 4)
-      four_kind = true;
-    if (count == 3)
-      three_kind = true;
-    if (count == 2)
-      pairs++;
-  }
-
-  if (straight && flush && royal)
-    return 0x900000;
-  if (straight && flush) 
-    return 0x800000;
-  if (four_kind)
-    return 0x700000; // Simplified score
-  if (three_kind && pairs >= 1)
-    return 0x600000;
-  if (flush)
-    return 0x500000;
-  if (straight)
-    return 0x400000;
-  if (three_kind)
-    return 0x300000;
-  if (pairs == 2)
-    return 0x200000;
-  if (pairs == 1)
-    return 0x100000;
-
-  return sorted[0].rank;
+  return evaluator().evaluate(to_omp_hand(cards));
 }
 
 int EquityModule::evaluate_7_cards(const std::vector<Card> &cards) {
   if (cards.size() < 5)
     return 0;
-  if (cards.size() == 5)
-    return evaluate_5_cards(cards);
-
-  int max_score = 0;
-  std::vector<int> p(cards.size());
-  std::fill(p.begin(), p.begin() + 5, 1);
-  std::fill(p.begin() + 5, p.end(), 0);
-
-  do {
-    std::vector<Card> combo;
-    for (size_t i = 0; i < cards.size(); ++i) {
-      if (p[i])
-        combo.push_back(cards[i]);
-    }
-    int score = evaluate_5_cards(combo);
-    if (score > max_score)
-      max_score = score;
-  } while (std::prev_permutation(p.begin(), p.end()));
-
-  return max_score;
+  return evaluator().evaluate(to_omp_hand(cards));
 }
 
 int EquityModule::bucketize_hand(const std::vector<Card> &hero_hand,
@@ -155,35 +110,34 @@ int EquityModule::bucketize_hand(const std::vector<Card> &hero_hand,
     if (high >= Rank::ACE && low >= Rank::TEN) {
       return suited ? BucketID::STRONG_MADE : BucketID::TOP_PAIR;
     }
-
     if (high >= Rank::KING && low >= Rank::TEN) {
       return suited ? BucketID::TOP_PAIR : BucketID::MIDDLE_PAIR;
     }
-
     if (high >= Rank::JACK && low >= Rank::NINE) {
       return suited ? BucketID::MIDDLE_PAIR : BucketID::WEAK_PAIR;
     }
-
     if (high >= Rank::TEN || suited) {
       return BucketID::WEAK_PAIR;
     }
-
     return BucketID::AIR;
   }
 
   std::vector<Card> all_cards = hero_hand;
   all_cards.insert(all_cards.end(), board_cards.begin(), board_cards.end());
 
-  int score = evaluate_7_cards(all_cards);
+  // OMP value: higher == better. Categories: 1=highcard, 2=pair, 3=two pair,
+  // 4=trips, 5=straight, 6=flush, 7=fullhouse, 8=quads, 9=straight flush.
+  int v = evaluate_7_cards(all_cards);
+  int cat = omp_category(v);
 
-  if (score >= 0x400000)
+  if (cat >= 5)            // straight or better
     return BucketID::STRONG_MADE;
-  if (score >= 0x300000)
+  if (cat == 4)            // three of a kind
     return BucketID::STRONG_MADE;
-  if (score >= 0x200000)
+  if (cat == 3)            // two pair
     return BucketID::TOP_PAIR;
 
-  if (score >= 0x100000) {
+  if (cat == 2) {          // single pair
     Rank board_high = Rank::TWO;
     for (const auto &c : board_cards)
       if (c.rank > board_high)
@@ -206,6 +160,7 @@ int EquityModule::bucketize_hand(const std::vector<Card> &hero_hand,
     return BucketID::MIDDLE_PAIR;
   }
 
+  // High card — check for flush draw.
   bool flush_draw = false;
   if (board_cards.size() >= 2) {
     std::map<Suit, int> suit_counts;
@@ -216,15 +171,12 @@ int EquityModule::bucketize_hand(const std::vector<Card> &hero_hand,
         flush_draw = true;
     }
   }
-
-  if (flush_draw)
-    return BucketID::STRONG_DRAW;
-
-  return BucketID::AIR;
+  return flush_draw ? BucketID::STRONG_DRAW : BucketID::AIR;
 }
 
 std::string EquityModule::canonical_state_signature(
-    const std::vector<Card> &hero_hand, const std::vector<Card> &board_cards) const {
+    const std::vector<Card> &hero_hand,
+    const std::vector<Card> &board_cards) const {
   std::vector<Card> cards = hero_hand;
   cards.insert(cards.end(), board_cards.begin(), board_cards.end());
 
@@ -246,35 +198,30 @@ std::string EquityModule::canonical_state_signature(
       if (next_label < 'd')
         ++next_label;
     }
-
     signature.push_back(rank_to_char(card.rank));
     signature.push_back(it->second);
     signature.push_back('|');
   }
-
   return signature.empty() ? "_" : signature;
 }
 
-// Fast Monte Carlo simulation for display equity
 double
 EquityModule::calculate_display_equity(const std::vector<Card> &hero_hand,
                                        const std::vector<Card> &board_cards) {
   if (hero_hand.size() != 2)
     return 0.0;
 
+  // Inner loop now runs at OMP-perfect-hash speed; iter count kept at 1000
+  // for the same precision the UI promises.
   int wins = 0;
   int ties = 0;
-  int iterations = 1000; // Enough for display precision
+  int iterations = 1000;
 
-  // Create a full deck
   std::vector<Card> full_deck;
-  for (int r = 0; r < 13; ++r) {
-    for (int s = 0; s < 4; ++s) {
+  for (int r = 0; r < 13; ++r)
+    for (int s = 0; s < 4; ++s)
       full_deck.emplace_back(static_cast<Rank>(r), static_cast<Suit>(s));
-    }
-  }
 
-  // Remove known cards
   auto remove_card = [&](const Card &c) {
     full_deck.erase(std::remove_if(full_deck.begin(), full_deck.end(),
                                    [&](const Card &x) {
@@ -283,11 +230,17 @@ EquityModule::calculate_display_equity(const std::vector<Card> &hero_hand,
                                    }),
                     full_deck.end());
   };
+  for (const auto &c : hero_hand) remove_card(c);
+  for (const auto &c : board_cards) remove_card(c);
 
-  for (const auto &c : hero_hand)
-    remove_card(c);
-  for (const auto &c : board_cards)
-    remove_card(c);
+  // Pre-build a partial-Hand from hero + known board so the inner loop only
+  // adds (5 - board_cards.size()) more cards per trial. This is the
+  // OMPEval-recommended idiom and matches their EquityCalculator's hot loop.
+  omp::Hand hero_partial = omp::Hand::empty();
+  for (const auto &c : hero_hand) hero_partial += omp::Hand(to_omp_card_id(c));
+
+  omp::Hand board_partial = omp::Hand::empty();
+  for (const auto &c : board_cards) board_partial += omp::Hand(to_omp_card_id(c));
 
   std::mt19937 rng(std::random_device{}());
 
@@ -295,31 +248,21 @@ EquityModule::calculate_display_equity(const std::vector<Card> &hero_hand,
     std::vector<Card> deck = full_deck;
     std::shuffle(deck.begin(), deck.end(), rng);
 
-    // Deal opponent hand
-    std::vector<Card> opp_hand = {deck[0], deck[1]};
+    omp::Hand opp_partial = omp::Hand::empty();
+    opp_partial += omp::Hand(to_omp_card_id(deck[0]));
+    opp_partial += omp::Hand(to_omp_card_id(deck[1]));
 
-    // Deal remaining board
-    std::vector<Card> current_board = board_cards;
-    int board_idx = 2;
-    while (current_board.size() < 5) {
-      current_board.push_back(deck[board_idx++]);
+    omp::Hand board_runout = board_partial;
+    int needed = 5 - static_cast<int>(board_cards.size());
+    for (int k = 0; k < needed; ++k) {
+      board_runout += omp::Hand(to_omp_card_id(deck[2 + k]));
     }
 
-    // Evaluate
-    std::vector<Card> hero_full = hero_hand;
-    hero_full.insert(hero_full.end(), current_board.begin(),
-                     current_board.end());
+    uint16_t hero_v = evaluator().evaluate(hero_partial + board_runout);
+    uint16_t opp_v  = evaluator().evaluate(opp_partial + board_runout);
 
-    std::vector<Card> opp_full = opp_hand;
-    opp_full.insert(opp_full.end(), current_board.begin(), current_board.end());
-
-    int hero_score = evaluate_7_cards(hero_full);
-    int opp_score = evaluate_7_cards(opp_full);
-
-    if (hero_score > opp_score)
-      wins++;
-    else if (hero_score == opp_score)
-      ties++;
+    if (hero_v > opp_v)        wins++;
+    else if (hero_v == opp_v)  ties++;
   }
 
   return (double)wins / iterations + ((double)ties / iterations) / 2.0;
