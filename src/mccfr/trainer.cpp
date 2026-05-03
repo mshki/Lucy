@@ -129,7 +129,9 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
     }
     double stack = stack_bb * bb;
 
-    // External sampling: traverse from each player's perspective
+    // Sample one trajectory from each traverser's perspective. The choice
+    // of sampler determines whether the traverser enumerates all actions
+    // (external) or samples one (outcome).
     for (int traverser = 0; traverser < sampled_players; ++traverser) {
       GameState s(nullptr, game->equity_module);
       s.betting_abstraction = abs;
@@ -138,7 +140,11 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
       deal_random_hole_cards(s, gen);
 
       std::vector<double> reach(sampled_players, 1.0);
-      cfr(s, traverser, 1.0, reach, 1.0, gen, 0);
+      if (sampler_ == SamplerType::OutcomeSampling) {
+        cfr_outcome(s, traverser, reach, 1.0, gen, 0, outcome_epsilon_);
+      } else {
+        cfr(s, traverser, 1.0, reach, 1.0, gen, 0);
+      }
 
       if (++batched_traversals >= batch_size_) {
         ++flush_count;
@@ -296,6 +302,119 @@ double Trainer::cfr(GameState &state, int traverser, double prob_traverser,
 
   return cfr(next, traverser, prob_traverser, next_reach, prob_chance, gen,
              depth + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Outcome-sampling MCCFR (Lanctot et al., NIPS 2009; OpenSpiel reference impl
+// at algorithms/outcome_sampling_mccfr.cc). Pure single-trajectory sampler.
+//
+// At every node (chance, traverser, opponent) sample exactly one action.
+// Sampling distribution at the traverser's nodes is epsilon-greedy mixed
+// with the current strategy; opponents and chance sample directly from
+// their natural distribution. The regret update uses importance weighting:
+//
+//   cf_factor   = opp_reach / sample_reach
+//   cf_value    = sigma(I, a*) * action_value * cf_factor
+//   cf_action_value(a) = action_value * cf_factor   if a == sampled
+//                      = 0                          otherwise
+//   regret(a)   = cf_action_value(a) - cf_value
+//
+// Strategy_sum gets += my_reach * sigma(I,a) / sample_reach for each a (we
+// pass `my_reach / sample_reach` to accumulate_realization_weight; the flush
+// kernel multiplies by sigma[a]).
+// ---------------------------------------------------------------------------
+
+double Trainer::cfr_outcome(GameState &state, int traverser,
+                            std::vector<double> &reach, double sample_reach,
+                            std::mt19937 &gen, int depth, double epsilon) {
+  if (state.is_terminal() || depth > 200)
+    return get_terminal_payoff(state, traverser);
+
+  // Chance node at street boundaries — sample uniformly over the deck.
+  if (state.is_betting_round_over() && state.stage != Stage::SHOWDOWN) {
+    int n_cards = 0;
+    if (state.stage == Stage::PREFLOP && state.community_cards.empty())
+      n_cards = 3;
+    else if (state.stage == Stage::FLOP && state.community_cards.size() == 3)
+      n_cards = 1;
+    else if (state.stage == Stage::TURN && state.community_cards.size() == 4)
+      n_cards = 1;
+    if (n_cards > 0) deal_random_community_cards(state, n_cards, gen);
+    state.next_street();
+    if (state.is_terminal()) return get_terminal_payoff(state, traverser);
+  }
+
+  Player *curr = state.get_current_player();
+  if (!curr) return 0.0;
+  int acting = curr->id;
+
+  std::string info = state.compute_information_set(acting);
+  auto legal = state.get_legal_actions();
+  if (legal.empty()) return get_terminal_payoff(state, traverser);
+
+  if (static_cast<int>(legal.size()) > kMaxActions) {
+    throw std::runtime_error(
+        "Trainer::cfr_outcome: legal action count exceeds kMaxActions");
+  }
+
+  int node_id = get_or_create_node_id(info, static_cast<int>(legal.size()));
+  const double *strat_row = node_matrix_.strategy_row(node_id);
+  std::vector<double> sigma(strat_row, strat_row + legal.size());
+
+  // Build the sampling distribution.
+  std::vector<double> sample_dist(legal.size(), 0.0);
+  if (acting == traverser) {
+    // Epsilon-greedy mix for exploration.
+    double inv_n = 1.0 / static_cast<double>(legal.size());
+    for (size_t i = 0; i < legal.size(); ++i) {
+      sample_dist[i] = epsilon * inv_n + (1.0 - epsilon) * sigma[i];
+    }
+  } else {
+    sample_dist = sigma;
+  }
+  std::discrete_distribution<> dist(sample_dist.begin(), sample_dist.end());
+  int a = dist(gen);
+  double sample_prob = sample_dist[a];
+  // Defensive — sample probability should be > 0 by construction (sigma is
+  // never all-zero post-init, and epsilon > 0 guarantees full support).
+  if (sample_prob <= 0.0) sample_prob = 1e-30;
+
+  // Recurse on the sampled action.
+  GameState next = state;
+  next.apply_action(legal[a], true);
+  std::vector<double> next_reach = reach;
+  next_reach[acting] *= sigma[a];
+  double action_value =
+      cfr_outcome(next, traverser, next_reach,
+                  sample_reach * sample_prob, gen, depth + 1, epsilon);
+
+  // Compute opponent-reach product (everyone except `acting`).
+  double opp_reach = 1.0;
+  for (size_t p = 0; p < reach.size(); ++p) {
+    if (static_cast<int>(p) != acting) opp_reach *= reach[p];
+  }
+  double cf_factor = opp_reach / sample_reach;
+
+  if (acting == traverser) {
+    // Regret update — sampled action carries the full importance-weighted
+    // value, others get 0.
+    double cf_value = sigma[a] * action_value * cf_factor;
+    for (size_t i = 0; i < legal.size(); ++i) {
+      double cf_action_value =
+          (i == static_cast<size_t>(a)) ? action_value * cf_factor : 0.0;
+      double regret = cf_action_value - cf_value;
+      node_matrix_.accumulate_regret(node_id, static_cast<int>(i), regret);
+    }
+  }
+
+  // Strategy_sum update (at all player nodes). With our flush math, passing
+  // `my_reach / sample_reach` and letting the kernel multiply by sigma[a]
+  // yields the desired increment of (my_reach / sample_reach) * sigma[a].
+  // `my_reach` here is the acting player's reach.
+  double sum_weight = reach[acting] / sample_reach;
+  node_matrix_.accumulate_realization_weight(node_id, sum_weight);
+
+  return action_value;
 }
 
 std::vector<double> Trainer::get_strategy(const std::string &info) {
