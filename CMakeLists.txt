@@ -13,6 +13,8 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/include/mccfr)
+# OMPEval headers expect flat #include "HandEvaluator.h" style
+include_directories(${PROJECT_SOURCE_DIR}/include/external/omp)
 
 # Core C++ sources (game engine + trainer + node matrix host code)
 set(SOURCES
@@ -23,6 +25,12 @@ set(SOURCES
     src/mccfr/trainer.cpp
     src/mccfr/node.cpp
     src/mccfr/node_matrix.cpp
+    # OMPEval (zekyll/OMPEval, ISC) — fast 7-card hand evaluator + equity
+    # calculator. Replaces the old brute-force evaluate_5/7_cards.
+    src/external/omp/HandEvaluator.cpp
+    src/external/omp/CardRange.cpp
+    src/external/omp/CombinedRange.cpp
+    src/external/omp/EquityCalculator.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
