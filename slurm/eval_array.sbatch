@@ -8,19 +8,13 @@
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
 # Pairwise eval array: each Lucy variant vs OpenSpiel baseline at matched
-# iteration budgets. Index layout:
-#
-#   index = ((lucy_variant_idx * len(ITERS) + iter_idx) * len(SEEDS) + seed_idx)
-#
-# At matched iters lucy_iters == baseline_iters; mismatched eval (frontier
-# table) is run via a second eval_array_full.sbatch invocation.
+# iter budgets. Index: idx = ((var * len(ITERS) + iter) * len(SEEDS) + seed).
 set -euo pipefail
 
 ITERS_LIST=(${LUCY_BENCH_ITERS:-1000 10000 100000 1000000})
 SEEDS=(${LUCY_BENCH_SEEDS:-1 2 3})
-LUCY_VARIANTS=(${LUCY_BENCH_LUCY_VARIANTS:-lucy-legacy lucy-cuda})
-
-PAIRS=${LUCY_BENCH_PAIRS:-2500}   # 2500 pairs = 5000 hands
+LUCY_VARIANTS=(${LUCY_BENCH_LUCY_VARIANTS:-lucy-omp lucy-dcfr lucy-os lucy-dcfr-os})
+PAIRS=${LUCY_BENCH_PAIRS:-2500}
 
 NI=${#ITERS_LIST[@]}
 NS=${#SEEDS[@]}
@@ -38,13 +32,16 @@ SEED=${SEEDS[$SEED_IDX]}
 LUCY_BENCH_ROOT="${LUCY_BENCH_ROOT:-$(pwd)}"
 cd "$LUCY_BENCH_ROOT"
 
-# Activate the venv built by slurm/setup_env.sh
 # shellcheck disable=SC1091
 source "$LUCY_BENCH_ROOT/envs/lucy/bin/activate"
 
 case "$VARIANT" in
-  lucy-legacy) LUCY_BIN="$LUCY_BENCH_ROOT/lucy-legacy/build/bin/PokerBotMAIF" ;;
-  lucy-cuda)   LUCY_BIN="$LUCY_BENCH_ROOT/lucy-cuda/build/bin/PokerBotMAIF" ;;
+  lucy-legacy)
+    LUCY_BIN="$LUCY_BENCH_ROOT/lucy-legacy/build/bin/PokerBotMAIF" ;;
+  lucy-cuda)
+    LUCY_BIN="$LUCY_BENCH_ROOT/lucy-cuda/build/bin/PokerBotMAIF" ;;
+  lucy-omp|lucy-dcfr|lucy-os|lucy-dcfr-os)
+    LUCY_BIN="$LUCY_BENCH_ROOT/lucy-v2/build/bin/PokerBotMAIF" ;;
   *) echo "[eval] unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
 
@@ -53,12 +50,10 @@ OS_MODEL="$LUCY_BENCH_ROOT/models/openspiel/iters=${ITERS}/seed=${SEED}.pkl"
 OUT="$LUCY_BENCH_ROOT/results/${VARIANT}-vs-openspiel/lucy_iters=${ITERS}/baseline_iters=${ITERS}/seed=${SEED}.json"
 
 if [[ ! -f "$LUCY_MODEL" ]]; then
-  echo "[eval] missing $LUCY_MODEL — did training finish?" >&2
-  exit 3
+  echo "[eval] missing $LUCY_MODEL" >&2; exit 3
 fi
 if [[ ! -f "$OS_MODEL" ]]; then
-  echo "[eval] missing $OS_MODEL — did training finish?" >&2
-  exit 3
+  echo "[eval] missing $OS_MODEL" >&2; exit 3
 fi
 
 echo "[eval] task=$TASK variant=$VARIANT iters=$ITERS seed=$SEED pairs=$PAIRS"

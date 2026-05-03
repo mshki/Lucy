@@ -26,8 +26,8 @@ mkdir -p logs
 
 ITERS=${ITERS:-"1000 10000 100000 1000000"}
 SEEDS=${SEEDS:-"1 2 3"}
-VARIANTS=${VARIANTS:-"lucy-legacy lucy-cuda openspiel"}
-LUCY_VARIANTS=${LUCY_VARIANTS:-"lucy-legacy lucy-cuda"}
+VARIANTS=${VARIANTS:-"lucy-omp lucy-dcfr lucy-os lucy-dcfr-os openspiel"}
+LUCY_VARIANTS=${LUCY_VARIANTS:-"lucy-omp lucy-dcfr lucy-os lucy-dcfr-os"}
 PAIRS=${PAIRS:-2500}
 PARTITION=${PARTITION:-cpu}
 ACCOUNT=${ACCOUNT:-pi_machta_umass_edu}

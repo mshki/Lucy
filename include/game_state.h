@@ -32,6 +32,11 @@ enum class ActionType { FOLD, CHECK, CALL, BET, RAISE, ALLIN };
 //   0 = FOLD, 1 = CHECK/CALL, 2 = POT, 3 = ALLIN
 enum class BettingAbstraction { LEGACY, FCPA };
 
+// Hand-strength abstraction:
+//   V1 — the legacy 10-bucket heuristic (BucketID enum)
+//   V2 — value-quantile buckets: 169 / 200 / 200 / 200 per street
+enum class HandAbstraction { V1_HEURISTIC_10, V2_VALUE_QUANTILES };
+
 // Minimal player struct for MCCFR
 struct Player {
   int id;
@@ -83,6 +88,7 @@ struct GameState {
   Stage stage;
   StateType type;
   BettingAbstraction betting_abstraction = BettingAbstraction::LEGACY;
+  HandAbstraction hand_abstraction = HandAbstraction::V1_HEURISTIC_10;
 
   GameState(RiskProfiler *rp, EquityModule *em);
 
