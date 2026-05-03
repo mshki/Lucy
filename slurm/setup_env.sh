@@ -73,29 +73,22 @@ echo "[setup] installing python deps via $PIP"
 # 4. Build both Lucy variants -----------------------------------------------
 build_variant() {
   local src="$1" build="$2" tag="$3"
-  echo "[setup] building $tag from $src -> $build"
+  echo "[setup] building $tag from $src"
+  # Lucy's CMakeLists hardcodes RUNTIME_OUTPUT_DIRECTORY=<src>/build/bin so
+  # the actual binary path is $src/build/bin/PokerBotMAIF regardless of -B.
   cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release >/dev/null
   cmake --build "$build" -j"$(nproc)"
-  echo "[setup] $tag binary: $build/bin/PokerBotMAIF"
+  echo "[setup] $tag binary: $src/build/bin/PokerBotMAIF"
 }
 
-CUDA_SRC="${CUDA_SRC:-$LUCY_BENCH_ROOT/lucy-cuda}"
-LEGACY_SRC="${LEGACY_SRC:-$LUCY_BENCH_ROOT/lucy-legacy}"
-
-CUDA_BUILD="${CUDA_BUILD:-$LUCY_BENCH_ROOT/build-cuda}"
-LEGACY_BUILD="${LEGACY_BUILD:-$LUCY_BENCH_ROOT/build-legacy}"
-
-if [[ -d "$CUDA_SRC" ]]; then
-  build_variant "$CUDA_SRC" "$CUDA_BUILD" "lucy-cuda"
-else
-  echo "[setup] WARNING: $CUDA_SRC not found, skipping cuda variant"
-fi
-
-if [[ -d "$LEGACY_SRC" ]]; then
-  build_variant "$LEGACY_SRC" "$LEGACY_BUILD" "lucy-legacy"
-else
-  echo "[setup] WARNING: $LEGACY_SRC not found, skipping legacy variant"
-fi
+for tag in lucy-cuda lucy-legacy lucy-v2; do
+  src="$LUCY_BENCH_ROOT/$tag"
+  if [[ -d "$src" ]]; then
+    build_variant "$src" "$src/build" "$tag"
+  else
+    echo "[setup] WARNING: $src not found, skipping $tag"
+  fi
+done
 
 # 5. Workspace dirs ---------------------------------------------------------
 mkdir -p "$LUCY_BENCH_ROOT/models" "$LUCY_BENCH_ROOT/results" "$LUCY_BENCH_ROOT/logs"

@@ -133,6 +133,7 @@ void Trainer::train(int iterations, int num_players, unsigned seed,
     for (int traverser = 0; traverser < sampled_players; ++traverser) {
       GameState s(nullptr, game->equity_module);
       s.betting_abstraction = abs;
+      s.hand_abstraction = game->hand_abstraction;
       s.init_game_setup(sampled_players, stack, sb, bb);
       s.start_hand();
       deal_random_hole_cards(s, gen);

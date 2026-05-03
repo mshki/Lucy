@@ -251,10 +251,13 @@ static void deal_board_for_stage(GameState &state, Stage target,
   state.set_community_cards(chosen);
 }
 
-static int serve_mode(Trainer &trainer, BettingAbstraction abs) {
+static int serve_mode(Trainer &trainer, BettingAbstraction abs,
+                      HandAbstraction hand_abs) {
   std::cout.setf(std::ios::unitbuf);
   std::cerr << "[lucy-serve] ready abstraction="
             << (abs == BettingAbstraction::FCPA ? "fcpa" : "legacy")
+            << " hand="
+            << (hand_abs == HandAbstraction::V2_VALUE_QUANTILES ? "v2" : "v1")
             << "\n";
 
   std::string line;
@@ -285,6 +288,7 @@ static int serve_mode(Trainer &trainer, BettingAbstraction abs) {
       EquityModule em;
       GameState s(nullptr, &em);
       s.betting_abstraction = abs;
+      s.hand_abstraction = hand_abs;
       s.init_game_setup(num_players, starting, sb, bb);
       s.start_hand(dealer);
 
@@ -379,6 +383,7 @@ struct Args {
   std::string out_path = "poker_model.dat";
   std::string in_path  = "poker_model.dat";
   BettingAbstraction abstraction = BettingAbstraction::LEGACY;
+  HandAbstraction hand_abstraction = HandAbstraction::V1_HEURISTIC_10;
   bool randomize_config = false;
   double stack_bb = 100.0;
   double sb = 1.0;
@@ -403,6 +408,7 @@ static void print_usage() {
     "  --seed N               PRNG seed (0 = nondeterministic)\n"
     "  --out PATH             Save model to PATH (train mode)\n"
     "  --abstraction MODE     legacy|fcpa  (default legacy)\n"
+    "  --hand-abstraction H   v1|v2 (default v1; v2 = 169/200/200/200 buckets)\n"
     "  --randomize-config     Use legacy randomized stack/players sampling\n"
     "  --stack-bb N           Fixed stack size in BB (default 100)\n"
     "  --sb N                 Small blind chips (default 1)\n"
@@ -440,6 +446,12 @@ static Args parse_args(int argc, char **argv) {
       else if (v == "legacy") a.abstraction = BettingAbstraction::LEGACY;
       else { std::cerr << "unknown abstraction: " << v << "\n"; std::exit(2); }
     }
+    else if (s == "--hand-abstraction") {
+      std::string v = next("--hand-abstraction");
+      if (v == "v1")      a.hand_abstraction = HandAbstraction::V1_HEURISTIC_10;
+      else if (v == "v2") a.hand_abstraction = HandAbstraction::V2_VALUE_QUANTILES;
+      else { std::cerr << "unknown hand-abstraction: " << v << "\n"; std::exit(2); }
+    }
     else if (s == "--randomize-config") a.randomize_config = true;
     else if (s == "--stack-bb")     a.stack_bb = std::stod(next("--stack-bb"));
     else if (s == "--sb")           a.sb = std::stod(next("--sb"));
@@ -465,6 +477,7 @@ int main(int argc, char *argv[]) {
   EquityModule em;
   GameState game(&rp, &em);
   game.betting_abstraction = a.abstraction;
+  game.hand_abstraction = a.hand_abstraction;
   Trainer trainer(&game);
   trainer.set_batch_size(a.batch_size);
   // Map the --cfr-variant string to DcfrParams.
@@ -497,7 +510,7 @@ int main(int argc, char *argv[]) {
 
   if (a.cmd == Args::Cmd::SERVE) {
     trainer.load_from_file(a.in_path);
-    return serve_mode(trainer, a.abstraction);
+    return serve_mode(trainer, a.abstraction, a.hand_abstraction);
   }
 
   if (a.cmd == Args::Cmd::INTERACTIVE) {

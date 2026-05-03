@@ -29,6 +29,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <random>
@@ -70,6 +72,125 @@ inline int omp_category(uint16_t v) { return v >> 12; }
 } // namespace
 
 bool compareCards(const Card &a, const Card &b) { return a.rank > b.rank; }
+
+// ---------------------------------------------------------------------------
+// EquityModule v2 abstraction state
+//
+// Default ctor tries to load `bucket_boundaries.dat` from the cwd at startup.
+// Format: 4-byte magic 'LBKT', 4-byte version=1, then for each of
+// {flop, turn, river}: 4-byte int n_cutoffs, then n_cutoffs 4-byte ints.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kBucketMagic = 0x4C424B54u; // 'LBKT'
+
+// Map a 0..51 (rank, suit) Lucy card to OMP's same encoding.
+inline unsigned to_omp_card_for_bucket(const Card &c) {
+  return static_cast<unsigned>(c.rank) * 4u + static_cast<unsigned>(c.suit);
+}
+} // namespace
+
+EquityModule::EquityModule() {
+  try_load_bucket_boundaries("bucket_boundaries.dat");
+}
+
+void EquityModule::try_load_bucket_boundaries(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return; // silently fall back to uniform binning
+  uint32_t magic = 0, version = 0;
+  in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+  in.read(reinterpret_cast<char *>(&version), sizeof(version));
+  if (magic != kBucketMagic || version != 1) {
+    std::cerr << "[equity] bucket_boundaries.dat magic/version mismatch; "
+              << "ignoring.\n";
+    return;
+  }
+  auto read_vec = [&](std::vector<int> &dst) {
+    int32_t n = 0;
+    in.read(reinterpret_cast<char *>(&n), sizeof(n));
+    dst.resize(n);
+    in.read(reinterpret_cast<char *>(dst.data()), n * sizeof(int));
+  };
+  read_vec(flop_cutoffs_);
+  read_vec(turn_cutoffs_);
+  read_vec(river_cutoffs_);
+  std::cerr << "[equity] loaded bucket_boundaries.dat: "
+            << flop_cutoffs_.size() << "/" << turn_cutoffs_.size()
+            << "/" << river_cutoffs_.size() << " cutoffs (flop/turn/river)\n";
+}
+
+int EquityModule::bin_index(int v, const std::vector<int> &cutoffs,
+                            int n_bins) {
+  if (cutoffs.empty()) {
+    // Fallback: divide OMP's [0, 9*4096] range uniformly into n_bins.
+    constexpr int kOmpMax = 9 * 4096; // top of straight-flush category
+    int b = (v * n_bins) / (kOmpMax + 1);
+    if (b < 0) b = 0;
+    if (b >= n_bins) b = n_bins - 1;
+    return b;
+  }
+  auto it = std::upper_bound(cutoffs.begin(), cutoffs.end(), v);
+  return static_cast<int>(it - cutoffs.begin());
+}
+
+int EquityModule::preflop_canonical_index(const Card &a, const Card &b) {
+  // 169 canonical 2-card holdings. We index via:
+  //   pairs (13 of them):    0..12   high-rank == 0..12
+  //   suited (78 of them):  13..90   pair (lo, hi) lexicographic with
+  //                                  hi > lo, high+low encoded as
+  //                                  13 + (lo * 13 + hi) compressed
+  //   offsuit (78 of them): 91..168  same encoding as suited but offset
+  // We use a more direct scheme: the 169 = 13 (pairs) + C(13,2) (suited)
+  //                                       + C(13,2) (offsuit).
+  Rank hi = (a.rank > b.rank) ? a.rank : b.rank;
+  Rank lo = (a.rank > b.rank) ? b.rank : a.rank;
+  bool is_pair = a.rank == b.rank;
+  bool is_suited = a.suit == b.suit;
+  if (is_pair) {
+    return static_cast<int>(hi); // 0..12
+  }
+  // hi > lo (strict). Convert (hi, lo) to a 0..77 index via lexicographic.
+  // i = (hi * (hi - 1)) / 2 + lo  for hi in 1..12, lo in 0..hi-1.
+  int idx = (static_cast<int>(hi) * (static_cast<int>(hi) - 1)) / 2
+            + static_cast<int>(lo);
+  return is_suited ? (13 + idx) : (13 + 78 + idx);
+}
+
+int EquityModule::v2_global_index(int st, int per_street) const {
+  switch (st) {
+  case PRE:   return per_street;                                   // 0..168
+  case FLOP:  return counts_.preflop + per_street;                 // 169..368
+  case TURN:  return counts_.preflop + counts_.flop + per_street;  // 369..568
+  case RIVER: return counts_.preflop + counts_.flop + counts_.turn
+                + per_street;                                       // 569..768
+  default:    return 0;
+  }
+}
+
+int EquityModule::bucketize_hand_v2(const std::vector<Card> &hero_hand,
+                                    const std::vector<Card> &board_cards,
+                                    street st) const {
+  if (hero_hand.size() < 2) return 0;
+  if (st == PRE || board_cards.empty()) {
+    return preflop_canonical_index(hero_hand[0], hero_hand[1]);
+  }
+
+  // Build OMP hand with however many board cards we have.
+  omp::Hand h = omp::Hand::empty();
+  for (const auto &c : hero_hand) h += omp::Hand(to_omp_card_for_bucket(c));
+  for (const auto &c : board_cards) h += omp::Hand(to_omp_card_for_bucket(c));
+
+  uint16_t v = 0;
+  static const omp::HandEvaluator E;
+  v = E.evaluate(h);
+
+  switch (st) {
+  case FLOP:  return bin_index(v, flop_cutoffs_,  counts_.flop);
+  case TURN:  return bin_index(v, turn_cutoffs_,  counts_.turn);
+  case RIVER: return bin_index(v, river_cutoffs_, counts_.river);
+  default:    return 0;
+  }
+}
 
 int EquityModule::evaluate_5_cards(const std::vector<Card> &cards) {
   if (cards.size() != 5)

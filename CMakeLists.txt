@@ -53,6 +53,16 @@ else()
     target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels_cpu.cpp)
 endif()
 
+# Bucket-boundaries builder — separate executable, builds the
+# bucket_boundaries.dat lookup table used by EquityModule's V2 abstraction.
+add_executable(build_bucket_boundaries
+    src/build_bucket_boundaries.cpp
+    src/external/omp/HandEvaluator.cpp
+)
+set_target_properties(build_bucket_boundaries PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
+)
+
 # Demo executable (kernel sandbox) — only when CUDA is available.
 if(CMAKE_CUDA_COMPILER)
     add_executable(demo_code demo_code.cu)
