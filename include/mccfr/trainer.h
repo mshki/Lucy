@@ -28,6 +28,11 @@ private:
   NodeMatrix node_matrix_;
   std::unordered_map<InfoSetKey, int> info_to_id_;
   int batch_size_ = kDefaultBatchSize;
+  // DCFR (alpha, beta, gamma). Default = vanilla CFR (no discount). Trainer's
+  // train() loop passes `flush_count` as the iteration counter to flush() so
+  // the discount is applied per-flush, not per-CFR-traversal — keeping the
+  // schedule independent of batch_size.
+  DcfrParams dcfr_ = {1e30, 1e30, 0.0};
 
   double cfr(GameState &state, int player_id, double prob_traverser,
              std::vector<double> &reach, double prob_chance, std::mt19937 &gen,
@@ -51,6 +56,8 @@ public:
   ~Trainer();
 
   void set_batch_size(int n) { batch_size_ = n > 0 ? n : 1; }
+  void set_dcfr(DcfrParams p) { dcfr_ = p; }
+  DcfrParams dcfr() const { return dcfr_; }
 
   // Train with a fixed configuration suitable for benchmarking against an
   // external solver. Set `randomize_config=false` for reproducible benchmarks
