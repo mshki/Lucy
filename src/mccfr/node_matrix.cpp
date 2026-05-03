@@ -50,13 +50,14 @@ void NodeMatrix::accumulate_realization_weight(int id, double weight) {
   pending_weights_[id] += weight;
 }
 
-void NodeMatrix::flush() {
+void NodeMatrix::flush(int iteration, DcfrParams dcfr) {
   if (n_ == 0)
     return;
 
-  launch_apply_regret_deltas(regret_sum_, pending_deltas_, n_, k_);
+  launch_apply_regret_deltas(regret_sum_, pending_deltas_, n_, k_,
+                             iteration, dcfr);
   launch_regret_match(regret_sum_, strategy_, strategy_sum_, num_actions_,
-                      pending_weights_, n_, k_);
+                      pending_weights_, n_, k_, iteration, dcfr);
 
   std::fill(pending_deltas_.begin(), pending_deltas_.end(), 0.0);
   std::fill(pending_weights_.begin(), pending_weights_.end(), 0.0);
