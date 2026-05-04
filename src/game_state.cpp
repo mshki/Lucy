@@ -286,11 +286,11 @@ string GameState::compute_information_set(int player_id) {
 
   int bucket = 0;
   if (equity_module && p->hole_cards.size() >= 2) {
-    if (hand_abstraction == HandAbstraction::V2_VALUE_QUANTILES) {
-      // V2 bucketing already encodes hand strength + suit canonicalization
-      // implicitly. We use the global street-prefixed bucket index as the
-      // entire bucket signature; the suit_signature below is dropped to
-      // reclaim the infoset count savings.
+    if (hand_abstraction == HandAbstraction::V3_EHS_CLUSTERS) {
+      int per_street = equity_module->bucketize_hand_v3(p->hole_cards,
+                                                        community_cards, st);
+      bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);
+    } else if (hand_abstraction == HandAbstraction::V2_VALUE_QUANTILES) {
       int per_street = equity_module->bucketize_hand_v2(p->hole_cards,
                                                         community_cards, st);
       bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);
@@ -300,11 +300,10 @@ string GameState::compute_information_set(int player_id) {
     }
   }
 
-  // V1 abstraction: include the suit-canonical signature in the info-set
-  // key (huge for distinguishing strategically equivalent boards). V2's
-  // bucket already encodes hand strength + suits implicitly via the
-  // OMP-evaluator-based clustering, so we drop the signature to keep
-  // infoset count manageable.
+  // V1 includes the suit-canonical signature in the info-set key (huge for
+  // distinguishing strategically equivalent boards). V2 / V3 already encode
+  // hand strength via OMP / EHS² clustering, so we drop the signature to
+  // keep infoset count manageable.
   std::string suit_signature = "_";
   if (hand_abstraction == HandAbstraction::V1_HEURISTIC_10
       && equity_module && p->hole_cards.size() >= 2) {

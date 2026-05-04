@@ -86,16 +86,31 @@ public:
   int bucketize_hand(const std::vector<Card> &hero_hand,
                      const std::vector<Card> &board_cards, street street);
 
-  // V2 abstraction: 169 / 200 / 200 / 200 buckets per street.
-  //   preflop:  one of 169 canonical 2-card holdings (suit isomorphism)
-  //   flop:     OMP 5-card value, binned into 200 quantiles
-  //   turn:     OMP 6-card value, binned into 200 quantiles
-  //   river:    OMP 7-card value, binned into 200 quantiles
-  // Quantile cutoffs are loaded from `bucket_boundaries.dat` if present in
-  // the cwd; otherwise fall back to uniform-OMP-value bins (less accurate
-  // distribution but still 200 distinct buckets).
+  // V2 abstraction: 169 / 200 / 200 / 200 buckets per street, scalar-OMP-
+  // value-quantile feature. Misses draw potential (flush draws look like
+  // high-card hands by current value). Use V3 for stronger play.
   int bucketize_hand_v2(const std::vector<Card> &hero_hand,
                         const std::vector<Card> &board_cards, street st) const;
+
+  // V3 abstraction (Pluribus / Slumbot / Libratus standard): 169 preflop
+  // canonical hands + 200 EHS²-cluster buckets per post-flop street.
+  //
+  // For each (hole, board) on a post-flop street, we compute Expected Hand
+  // Strength squared by Monte Carlo: sample N opponent hole-card pairs and
+  // sample one runout to the river per opponent. EHS² = mean(result²)
+  // where result ∈ {0, 0.5, 1} for {loss, tie, win}. EHS² captures both
+  // made-hand strength (high mean) AND draw potential (high variance →
+  // higher EHS² for fixed mean).
+  //
+  // Buckets are 1-D KMeans cluster centroids over EHS² values precomputed
+  // by `build_equity_buckets`, loaded from `equity_buckets.dat`. At query
+  // time we compute EHS² for the current hand on the fly (~10 µs per
+  // query at OMP speed) and snap to the nearest centroid.
+  //
+  // Falls back to V2 if `equity_buckets.dat` isn't present.
+  int bucketize_hand_v3(const std::vector<Card> &hero_hand,
+                        const std::vector<Card> &board_cards, street st,
+                        int n_rollouts = 100) const;
 
   // Canonical suit-isomorphic signature for information sets
   std::string canonical_state_signature(const std::vector<Card> &hero_hand,
@@ -121,15 +136,29 @@ public:
 private:
   int evaluate_5_cards(const std::vector<Card> &cards);
 
-  // Quantile cutoffs per street. NULL = fallback to uniform-OMP-value bins.
+  // V2 quantile cutoffs per street. Empty = fallback to uniform-OMP-value bins.
   std::vector<int> flop_cutoffs_;   // 199 entries → 200 bins
   std::vector<int> turn_cutoffs_;
   std::vector<int> river_cutoffs_;
+  // V3 EHS² centroids per street (sorted ascending → bucket index = position).
+  std::vector<double> flop_ehs_centroids_;
+  std::vector<double> turn_ehs_centroids_;
+  std::vector<double> river_ehs_centroids_;
   BucketCounts counts_;
 
   void try_load_bucket_boundaries(const std::string &path);
+  void try_load_equity_buckets(const std::string &path);
   // Map a raw OMP value to a bin index using cutoffs.
   static int bin_index(int v, const std::vector<int> &cutoffs, int n_bins);
+  // Map an EHS² value to the nearest centroid index.
+  static int nearest_centroid(double v, const std::vector<double> &centroids);
+  // Compute EHS² on the fly via N Monte Carlo rollouts. Uses a per-thread
+  // RNG seeded from the hand state so repeated queries on the same state
+  // give the same answer (otherwise CFR's regret signal becomes inconsistent
+  // across iterations for the same info-set).
+  double compute_ehs2_runtime(const std::vector<Card> &hole,
+                              const std::vector<Card> &board,
+                              int n_rollouts) const;
 
 public:
   // Helper exposed for the build_bucket_boundaries tool. Computes the

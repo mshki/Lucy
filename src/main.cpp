@@ -257,7 +257,9 @@ static int serve_mode(Trainer &trainer, BettingAbstraction abs,
   std::cerr << "[lucy-serve] ready abstraction="
             << (abs == BettingAbstraction::FCPA ? "fcpa" : "legacy")
             << " hand="
-            << (hand_abs == HandAbstraction::V2_VALUE_QUANTILES ? "v2" : "v1")
+            << (hand_abs == HandAbstraction::V3_EHS_CLUSTERS ? "v3"
+                : hand_abs == HandAbstraction::V2_VALUE_QUANTILES ? "v2"
+                : "v1")
             << "\n";
 
   std::string line;
@@ -414,7 +416,10 @@ static void print_usage() {
     "  --seed N               PRNG seed (0 = nondeterministic)\n"
     "  --out PATH             Save model to PATH (train mode)\n"
     "  --abstraction MODE     legacy|fcpa  (default legacy)\n"
-    "  --hand-abstraction H   v1|v2 (default v1; v2 = 169/200/200/200 buckets)\n"
+    "  --hand-abstraction H   v1|v2|v3  (default v1)\n"
+    "                         v1 = legacy 10-bucket heuristic\n"
+    "                         v2 = OMP-value quantile, 169/200/200/200 per street\n"
+    "                         v3 = EHS² cluster centroids, 169/200/200/200 per street\n"
     "  --randomize-config     Use legacy randomized stack/players sampling\n"
     "  --stack-bb N           Fixed stack size in BB (default 100)\n"
     "  --sb N                 Small blind chips (default 1)\n"
@@ -461,6 +466,7 @@ static Args parse_args(int argc, char **argv) {
       std::string v = next("--hand-abstraction");
       if (v == "v1")      a.hand_abstraction = HandAbstraction::V1_HEURISTIC_10;
       else if (v == "v2") a.hand_abstraction = HandAbstraction::V2_VALUE_QUANTILES;
+      else if (v == "v3") a.hand_abstraction = HandAbstraction::V3_EHS_CLUSTERS;
       else { std::cerr << "unknown hand-abstraction: " << v << "\n"; std::exit(2); }
     }
     else if (s == "--randomize-config") a.randomize_config = true;

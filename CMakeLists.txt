@@ -53,13 +53,23 @@ else()
     target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels_cpu.cpp)
 endif()
 
-# Bucket-boundaries builder — separate executable, builds the
-# bucket_boundaries.dat lookup table used by EquityModule's V2 abstraction.
+# Bucket-boundaries builder — V2 abstraction (OMP-value quantile cuts).
 add_executable(build_bucket_boundaries
     src/build_bucket_boundaries.cpp
     src/external/omp/HandEvaluator.cpp
 )
 set_target_properties(build_bucket_boundaries PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
+)
+
+# Equity-bucket builder — V3 abstraction (EHS² + KMeans cluster centroids).
+# Run once before training:
+#   ./build/bin/build_equity_buckets --samples 100000 --opp-samples 50
+add_executable(build_equity_buckets
+    src/build_equity_buckets.cpp
+    src/external/omp/HandEvaluator.cpp
+)
+set_target_properties(build_equity_buckets PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
 )
 

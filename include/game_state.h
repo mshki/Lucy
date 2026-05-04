@@ -33,9 +33,18 @@ enum class ActionType { FOLD, CHECK, CALL, BET, RAISE, ALLIN };
 enum class BettingAbstraction { LEGACY, FCPA };
 
 // Hand-strength abstraction:
-//   V1 — the legacy 10-bucket heuristic (BucketID enum)
-//   V2 — value-quantile buckets: 169 / 200 / 200 / 200 per street
-enum class HandAbstraction { V1_HEURISTIC_10, V2_VALUE_QUANTILES };
+//   V1 — legacy 10-bucket heuristic (BucketID enum). Coarse, ignores
+//        draw potential, ignores most board texture.
+//   V2 — 169/200/200/200 buckets per street using OMP-value quantile cuts.
+//        Captures current made-hand strength but NOT draw potential.
+//   V3 — 169/200/200/200 buckets per street using EHS² (Expected Hand
+//        Strength squared) cluster centroids. Captures both made-hand
+//        strength AND draw potential. Pluribus / Slumbot / Libratus standard.
+enum class HandAbstraction {
+  V1_HEURISTIC_10,
+  V2_VALUE_QUANTILES,
+  V3_EHS_CLUSTERS,
+};
 
 // Minimal player struct for MCCFR
 struct Player {

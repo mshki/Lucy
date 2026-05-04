@@ -92,6 +92,7 @@ inline unsigned to_omp_card_for_bucket(const Card &c) {
 
 EquityModule::EquityModule() {
   try_load_bucket_boundaries("bucket_boundaries.dat");
+  try_load_equity_buckets("equity_buckets.dat");
 }
 
 void EquityModule::try_load_bucket_boundaries(const std::string &path) {
@@ -117,6 +118,138 @@ void EquityModule::try_load_bucket_boundaries(const std::string &path) {
   std::cerr << "[equity] loaded bucket_boundaries.dat: "
             << flop_cutoffs_.size() << "/" << turn_cutoffs_.size()
             << "/" << river_cutoffs_.size() << " cutoffs (flop/turn/river)\n";
+}
+
+void EquityModule::try_load_equity_buckets(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return;
+  uint32_t magic = 0, version = 0;
+  in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+  in.read(reinterpret_cast<char *>(&version), sizeof(version));
+  // Magic for the EHS² centroids file: 'LECB' (Lucy Equity Cluster Buckets).
+  if (magic != 0x4C454342u || version != 1) {
+    std::cerr << "[equity] equity_buckets.dat magic/version mismatch; "
+              << "ignoring.\n";
+    return;
+  }
+  auto read_vec = [&](std::vector<double> &dst) {
+    int32_t n = 0;
+    in.read(reinterpret_cast<char *>(&n), sizeof(n));
+    dst.resize(n);
+    in.read(reinterpret_cast<char *>(dst.data()), n * sizeof(double));
+    std::sort(dst.begin(), dst.end()); // ensure ascending so bucket id ↑ with strength
+  };
+  read_vec(flop_ehs_centroids_);
+  read_vec(turn_ehs_centroids_);
+  read_vec(river_ehs_centroids_);
+  std::cerr << "[equity] loaded equity_buckets.dat: "
+            << flop_ehs_centroids_.size() << "/" << turn_ehs_centroids_.size()
+            << "/" << river_ehs_centroids_.size()
+            << " EHS² centroids (flop/turn/river)\n";
+}
+
+int EquityModule::nearest_centroid(double v,
+                                   const std::vector<double> &centroids) {
+  if (centroids.empty()) return 0;
+  auto it = std::lower_bound(centroids.begin(), centroids.end(), v);
+  if (it == centroids.begin()) return 0;
+  if (it == centroids.end()) return static_cast<int>(centroids.size()) - 1;
+  int hi = static_cast<int>(it - centroids.begin());
+  int lo = hi - 1;
+  // Pick the closer of the two adjacent centroids.
+  return (v - centroids[lo] < centroids[hi] - v) ? lo : hi;
+}
+
+double EquityModule::compute_ehs2_runtime(const std::vector<Card> &hole,
+                                           const std::vector<Card> &board,
+                                           int n_rollouts) const {
+  if (hole.size() < 2) return 0.0;
+  // Per-state PRNG seed: deterministic so the same (hole, board) gets the
+  // same EHS² across CFR iterations. CFR's regret signal must be consistent
+  // across visits to the same info-set; a non-deterministic feature would
+  // make the bucket id wobble and pollute the regret table. The seed
+  // hashes the dealt cards.
+  std::uint64_t seed = 0xcbf29ce484222325ULL;
+  auto fold_card = [&](const Card &c) {
+    seed ^= static_cast<std::uint64_t>(c.rank) * 4u
+            + static_cast<std::uint64_t>(c.suit);
+    seed *= 0x100000001b3ULL;
+  };
+  for (const auto &c : hole) fold_card(c);
+  for (const auto &c : board) fold_card(c);
+  std::mt19937_64 gen(seed);
+
+  // Build the per-card dealt mask.
+  std::vector<bool> dealt(52, false);
+  auto card_id = [](const Card &c) {
+    return static_cast<int>(c.rank) * 4 + static_cast<int>(c.suit);
+  };
+  for (const auto &c : hole) dealt[card_id(c)] = true;
+  for (const auto &c : board) dealt[card_id(c)] = true;
+  std::vector<int> remaining;
+  remaining.reserve(52 - hole.size() - board.size());
+  for (int c = 0; c < 52; ++c) if (!dealt[c]) remaining.push_back(c);
+
+  int board_needed = 5 - static_cast<int>(board.size());
+  if (board_needed < 0) board_needed = 0;
+
+  static const omp::HandEvaluator E;
+  omp::Hand hero_partial = omp::Hand::empty();
+  for (const auto &c : hole) hero_partial += omp::Hand(to_omp_card_for_bucket(c));
+  omp::Hand board_base = omp::Hand::empty();
+  for (const auto &c : board) board_base += omp::Hand(to_omp_card_for_bucket(c));
+
+  double sum_sq = 0.0;
+  int total = 0;
+  for (int r = 0; r < n_rollouts; ++r) {
+    int k = 2 + board_needed;
+    if ((int)remaining.size() < k) break;
+    for (int i = 0; i < k; ++i) {
+      std::uniform_int_distribution<int> d(i, (int)remaining.size() - 1);
+      int j = d(gen);
+      std::swap(remaining[i], remaining[j]);
+    }
+    omp::Hand opp_partial = omp::Hand::empty();
+    opp_partial += omp::Hand(static_cast<unsigned>(remaining[0]));
+    opp_partial += omp::Hand(static_cast<unsigned>(remaining[1]));
+    omp::Hand board_runout = board_base;
+    for (int b = 0; b < board_needed; ++b) {
+      board_runout += omp::Hand(static_cast<unsigned>(remaining[2 + b]));
+    }
+    uint16_t hv = E.evaluate(hero_partial + board_runout);
+    uint16_t ov = E.evaluate(opp_partial + board_runout);
+    double result;
+    if (hv > ov)        result = 1.0;
+    else if (hv == ov)  result = 0.5;
+    else                result = 0.0;
+    sum_sq += result * result;
+    ++total;
+  }
+  return total > 0 ? sum_sq / total : 0.0;
+}
+
+int EquityModule::bucketize_hand_v3(const std::vector<Card> &hero_hand,
+                                    const std::vector<Card> &board_cards,
+                                    street st, int n_rollouts) const {
+  if (hero_hand.size() < 2) return 0;
+  if (st == PRE || board_cards.empty()) {
+    return preflop_canonical_index(hero_hand[0], hero_hand[1]);
+  }
+
+  // Pick the right centroid table for the street. If the centroids weren't
+  // loaded (no equity_buckets.dat), fall back to V2 quantile bucketing.
+  const std::vector<double> *centroids = nullptr;
+  switch (st) {
+  case FLOP:  centroids = &flop_ehs_centroids_;  break;
+  case TURN:  centroids = &turn_ehs_centroids_;  break;
+  case RIVER: centroids = &river_ehs_centroids_; break;
+  default:    return 0;
+  }
+  if (centroids->empty()) {
+    return bucketize_hand_v2(hero_hand, board_cards, st);
+  }
+  double ehs2 = compute_ehs2_runtime(hero_hand, board_cards, n_rollouts);
+  return nearest_centroid(ehs2, *centroids);
 }
 
 int EquityModule::bin_index(int v, const std::vector<int> &cutoffs,
