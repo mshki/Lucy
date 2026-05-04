@@ -206,34 +206,25 @@ static const char *stage_name(Stage s) {
   }
 }
 
-// Translate a single FCPA action ID to a concrete Action object given the
-// current Lucy state. This must mirror get_legal_actions() in FCPA mode so
-// that the bet sizes used during history replay match those used at training.
-static Action fcpa_action_from_id(GameState &state, int player_id, int action_id) {
-  Player *p = state.get_player(player_id);
-  double call_amt = state.current_street_highest_bet - p->current_bet;
-  switch (action_id) {
-  case 0: return Action(player_id, ActionType::FOLD, 0);
-  case 1:
-    if (call_amt == 0) return Action(player_id, ActionType::CHECK, 0);
-    else return Action(player_id, ActionType::CALL,
-                       std::min((double)p->stack, (double)call_amt));
-  case 2: {
-    if (call_amt == 0) {
-      double pot = state.pot_size > 0 ? state.pot_size : state.big_blind_amount;
-      return Action(player_id, ActionType::BET, p->current_bet + pot);
-    } else {
-      double pot = std::max((double)state.pot_size, state.big_blind_amount);
-      double base = pot + call_amt;
-      double raise_to = state.current_street_highest_bet + base;
-      return Action(player_id, ActionType::RAISE, raise_to);
-    }
-  }
-  case 3:
-    return Action(player_id, ActionType::ALLIN, p->stack);
-  default:
+// Translate a single action ID to a concrete Action object given the
+// current Lucy state. Looks up the i-th legal action in the current
+// abstraction's `get_legal_actions()` list — abstraction-agnostic.
+//
+// For FCPA the IDs are stable {0=fold, 1=check/call, 2=pot, 3=allin}.
+// For STREET_RICH the IDs are 0..N-1 in the order Lucy emits them per
+// state (variable per state, agreed on by the harness via the serve
+// reply's `legal_actions` list).
+static Action action_from_id(GameState &state, int player_id, int action_id) {
+  // Temporarily set acting player for legality computation.
+  int saved = state.current_player_index;
+  state.current_player_index = player_id;
+  auto legal = state.get_legal_actions();
+  state.current_player_index = saved;
+
+  if (legal.empty() || action_id < 0 || action_id >= (int)legal.size()) {
     return Action(player_id, ActionType::FOLD, 0);
   }
+  return legal[action_id];
 }
 
 static void deal_board_for_stage(GameState &state, Stage target,
@@ -313,7 +304,7 @@ static int serve_mode(Trainer &trainer, BettingAbstraction abs,
           s.next_street();
           deal_board_for_stage(s, s.stage, board_cards);
         }
-        Action act = fcpa_action_from_id(s, p_act, a_id);
+        Action act = action_from_id(s, p_act, a_id);
         s.apply_action(act, true);
       }
 
@@ -415,7 +406,10 @@ static void print_usage() {
     "  --players N            Number of players (default 2)\n"
     "  --seed N               PRNG seed (0 = nondeterministic)\n"
     "  --out PATH             Save model to PATH (train mode)\n"
-    "  --abstraction MODE     legacy|fcpa  (default legacy)\n"
+    "  --abstraction MODE     legacy|fcpa|street-rich  (default legacy)\n"
+    "                         legacy      = 5-bet-size old default (0.33p..2p,allin)\n"
+    "                         fcpa        = OpenSpiel-compat 4-action {fold,call,pot,allin}\n"
+    "                         street-rich = Slumbot-style street-specific 5-7 actions\n"
     "  --hand-abstraction H   v1|v2|v3  (default v1)\n"
     "                         v1 = legacy 10-bucket heuristic\n"
     "                         v2 = OMP-value quantile, 169/200/200/200 per street\n"
@@ -458,8 +452,9 @@ static Args parse_args(int argc, char **argv) {
     else if (s == "--out")          a.out_path = next("--out");
     else if (s == "--abstraction") {
       std::string v = next("--abstraction");
-      if (v == "fcpa")        a.abstraction = BettingAbstraction::FCPA;
-      else if (v == "legacy") a.abstraction = BettingAbstraction::LEGACY;
+      if (v == "fcpa")             a.abstraction = BettingAbstraction::FCPA;
+      else if (v == "legacy")      a.abstraction = BettingAbstraction::LEGACY;
+      else if (v == "street-rich") a.abstraction = BettingAbstraction::STREET_RICH;
       else { std::cerr << "unknown abstraction: " << v << "\n"; std::exit(2); }
     }
     else if (s == "--hand-abstraction") {

@@ -30,7 +30,17 @@ enum class ActionType { FOLD, CHECK, CALL, BET, RAISE, ALLIN };
 //           {fold, check/call, pot-sized bet/raise, all-in}
 // Action ordering in FCPA mode preserves OpenSpiel's stable IDs:
 //   0 = FOLD, 1 = CHECK/CALL, 2 = POT, 3 = ALLIN
-enum class BettingAbstraction { LEGACY, FCPA };
+// Action abstraction for the betting tree.
+//   LEGACY      — original 5-bet sizes {0.33p, 0.66p, p, 2p, allin}, same per street
+//   FCPA        — research-standard 4-action {fold, call, pot, allin}, same per street
+//   STREET_RICH — Slumbot-style street-specific sizing (recommended for play):
+//                   preflop: {fold, call, 2.5×BB, 3×BB, 4×BB, allin}        (6)
+//                   flop:    {fold, check/call, 0.33p, 0.66p, p, allin}     (5-6)
+//                   turn:    {fold, check/call, 0.5p, p, 1.5p, allin}       (5-6)
+//                   river:   {fold, check/call, 0.5p, p, 1.5p, 2p, allin}   (6-7)
+//                 Captures human-poker tactics (pre-flop blind-multiplier raises,
+//                 river overbets, polarized turn sizing) that FCPA can't express.
+enum class BettingAbstraction { LEGACY, FCPA, STREET_RICH };
 
 // Hand-strength abstraction:
 //   V1 — legacy 10-bucket heuristic (BucketID enum). Coarse, ignores
@@ -130,6 +140,14 @@ struct GameState {
   int abstract_pot_size(double pot_bb) const;
   std::string abstract_bet_size(double bet_amount) const;
   std::string abstract_action_history() const;
+  // Imperfect-recall summary (Pluribus standard):
+  //   - aggressor relative-position per prior street (preflop, flop, turn),
+  //     where each is the player_id of the last raiser or 'X' if no raise
+  //   - number of bets/raises *this street*, capped at 4
+  // Drops the full action sequence — collapses strategically equivalent
+  // histories that differ only in non-strategic permutations of
+  // call/check/raise sequencing.
+  std::string imperfect_recall_summary() const;
 
   // Helpers
   int get_active_player_count();
