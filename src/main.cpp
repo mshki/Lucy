@@ -207,15 +207,45 @@ static const char *stage_name(Stage s) {
 }
 
 // Translate a single action ID to a concrete Action object given the
-// current Lucy state. Looks up the i-th legal action in the current
-// abstraction's `get_legal_actions()` list — abstraction-agnostic.
+// current Lucy state. Encoding depends on the betting abstraction:
 //
-// For FCPA the IDs are stable {0=fold, 1=check/call, 2=pot, 3=allin}.
-// For STREET_RICH the IDs are 0..N-1 in the order Lucy emits them per
-// state (variable per state, agreed on by the harness via the serve
-// reply's `legal_actions` list).
+//   FCPA: stable {0=fold, 1=check/call, 2=pot, 3=allin}, matches
+//         OpenSpiel's universal_poker fcpa action IDs.
+//   STREET_RICH: ID is the index into get_legal_actions() at the current
+//         state. Variable-length per state (agreed on by the harness via
+//         the serve reply's `legal_actions` list).
+//   LEGACY: use the index-into-legal-actions convention as well.
 static Action action_from_id(GameState &state, int player_id, int action_id) {
-  // Temporarily set acting player for legality computation.
+  Player *p = state.get_player(player_id);
+  double call_amt = state.current_street_highest_bet - p->current_bet;
+
+  // FCPA stable mapping (matches OpenSpiel universal_poker fcpa).
+  if (state.betting_abstraction == BettingAbstraction::FCPA) {
+    switch (action_id) {
+    case 0: return Action(player_id, ActionType::FOLD, 0);
+    case 1:
+      if (call_amt == 0) return Action(player_id, ActionType::CHECK, 0);
+      return Action(player_id, ActionType::CALL,
+                    std::min((double)p->stack, (double)call_amt));
+    case 2: {
+      if (call_amt == 0) {
+        double pot = state.pot_size > 0 ? state.pot_size
+                                         : state.big_blind_amount;
+        return Action(player_id, ActionType::BET, p->current_bet + pot);
+      }
+      double pot = std::max((double)state.pot_size, state.big_blind_amount);
+      double base = pot + call_amt;
+      double raise_to = state.current_street_highest_bet + base;
+      return Action(player_id, ActionType::RAISE, raise_to);
+    }
+    case 3:
+      return Action(player_id, ActionType::ALLIN, p->stack);
+    default:
+      return Action(player_id, ActionType::FOLD, 0);
+    }
+  }
+
+  // STREET_RICH / LEGACY: index-into-legal-actions semantics.
   int saved = state.current_player_index;
   state.current_player_index = player_id;
   auto legal = state.get_legal_actions();
