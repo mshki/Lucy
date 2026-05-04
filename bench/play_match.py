@@ -57,8 +57,10 @@ def make_openspiel_factory(model_path: str):
     return lambda pid, rng: OpenSpielMCCFRBot(pid, solver, rng)
 
 
-def make_lucy_factory(binary: str, model: str, abstraction: str = "fcpa"):
+def make_lucy_factory(binary: str, model: str, abstraction: str = "fcpa",
+                      hand_abstraction: str = "v1"):
     return lambda pid, rng: LucyBot(pid, binary, model, abstraction=abstraction,
+                                    hand_abstraction=hand_abstraction,
                                     rng=rng)
 
 
@@ -77,6 +79,7 @@ def make_factory(spec: str):
             binary=kvs["bin"],
             model=kvs["model"],
             abstraction=kvs.get("abstraction", "fcpa"),
+            hand_abstraction=kvs.get("hand_abstraction", "v1"),
         )
     raise ValueError(f"unknown bot spec: {spec}")
 

@@ -30,7 +30,9 @@ class LucyBot(pyspiel.Bot):
     """Plays Heads-Up NLHE FCPA via a long-running Lucy subprocess."""
 
     def __init__(self, player_id: int, lucy_binary: str, model_path: str,
-                 abstraction: str = "fcpa", rng: Optional[np.random.Generator] = None,
+                 abstraction: str = "fcpa",
+                 hand_abstraction: str = "v1",
+                 rng: Optional[np.random.Generator] = None,
                  stderr_to_devnull: bool = True):
         super().__init__()
         if not os.path.exists(lucy_binary):
@@ -39,9 +41,12 @@ class LucyBot(pyspiel.Bot):
             raise FileNotFoundError(f"Lucy model not found: {model_path}")
         self._player_id = player_id
         self._abstraction = abstraction
+        self._hand_abstraction = hand_abstraction
         self._rng = rng or np.random.default_rng()
         self._proc = subprocess.Popen(
-            [lucy_binary, "--serve", model_path, "--abstraction", abstraction],
+            [lucy_binary, "--serve", model_path,
+             "--abstraction", abstraction,
+             "--hand-abstraction", hand_abstraction],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL if stderr_to_devnull else None,
