@@ -150,6 +150,8 @@ def play_match(
     factory_a: Callable, factory_b: Callable,
     num_pairs: int, seed: int,
     log_every: Optional[int] = None,
+    bot_a_spec: str = "",
+    bot_b_spec: str = "",
 ) -> MatchResult:
     """Play ``num_pairs`` duplicate pairs (= 2 * num_pairs hands).
 
@@ -169,12 +171,23 @@ def play_match(
     if log_every is None:
         log_every = max(1, num_pairs // 20)
 
+    # Salt the bot RNG seeds with a stable hash of the bot specs so different
+    # variants compared at the same match seed don't share an action-sampling
+    # RNG state. Without this, two variants with similar but not identical
+    # policies will deterministically sample the same actions at every
+    # decision (same uniform draw + similar CDFs → same bin) and produce
+    # identical match outcomes — a "policy-coalescence" artifact that hides
+    # real differences. Using zlib.crc32 keeps the hash stable across runs.
+    import zlib
+    salt_a = zlib.crc32(bot_a_spec.encode()) & 0x7FFFFFFF
+    salt_b = zlib.crc32(bot_b_spec.encode()) & 0x7FFFFFFF
+
     t0 = time.time()
     for pair in range(num_pairs):
         # --- Hand 1: A in seat 0, B in seat 1 ------------------------------
         chance_state = chance_rng.bit_generator.state
-        a_rng = np.random.default_rng(seed + 1_000_000 * pair + 1)
-        b_rng = np.random.default_rng(seed + 1_000_000 * pair + 2)
+        a_rng = np.random.default_rng(seed + 1_000_000 * pair + 1 + salt_a)
+        b_rng = np.random.default_rng(seed + 1_000_000 * pair + 2 + salt_b)
         bot_a0 = factory_a(0, a_rng)
         bot_b1 = factory_b(1, b_rng)
         try:
@@ -185,8 +198,8 @@ def play_match(
 
         # --- Hand 2: B in seat 0, A in seat 1, SAME deck -------------------
         chance_rng.bit_generator.state = chance_state
-        a_rng = np.random.default_rng(seed + 1_000_000 * pair + 3)
-        b_rng = np.random.default_rng(seed + 1_000_000 * pair + 4)
+        a_rng = np.random.default_rng(seed + 1_000_000 * pair + 3 + salt_a)
+        b_rng = np.random.default_rng(seed + 1_000_000 * pair + 4 + salt_b)
         bot_b0 = factory_b(0, b_rng)
         bot_a1 = factory_a(1, a_rng)
         try:
@@ -252,7 +265,8 @@ def main():
 
     print(f"[match] {args.label_a} vs {args.label_b}, "
           f"pairs={args.pairs} seed={args.seed}", flush=True)
-    result = play_match(fa, fb, args.pairs, args.seed)
+    result = play_match(fa, fb, args.pairs, args.seed,
+                        bot_a_spec=args.bot_a, bot_b_spec=args.bot_b)
     result.bot_a = args.label_a
     result.bot_b = args.label_b
 
