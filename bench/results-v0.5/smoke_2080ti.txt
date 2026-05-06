@@ -1,0 +1,50 @@
+GPU 0: NVIDIA A16 (UUID: GPU-64c7aaa4-4ce1-23be-2ba2-fd909f613392)
+
+=== smoke: GPU 100 iters, 256 trajectories per iter ===
+[equity] loaded bucket_boundaries.dat: 199/199/199 cutoffs (flop/turn/river)
+[equity] loaded equity_buckets.dat: 200/200/200 EHS² centroids (flop/turn/river)
+[lucy-gpu] 100 iters x 256 traj/iter = 25600 trajectories in 0.0672892s (380447 traj/s); 580 infosets
+[gpu_cfr] saved 580 infosets -> /tmp/lucy_gpu_smoke.dat
+
+[gpu_cfr profile] iters=100 trajectories=25600
+  traversal: 32.38 ms total (323.84 us/iter)
+  match:     0.18 ms total (1.82 us/iter)
+  sync:      34.72 ms total
+[lucy] elapsed 0.29s
+[lucy] saved -> /tmp/lucy_gpu_smoke.dat
+
+=== smoke: GPU 1000 iters, 1024 trajectories per iter ===
+[equity] loaded bucket_boundaries.dat: 199/199/199 cutoffs (flop/turn/river)
+[equity] loaded equity_buckets.dat: 200/200/200 EHS² centroids (flop/turn/river)
+[lucy-gpu] 1000 iters x 1024 traj/iter = 1024000 trajectories in 0.312128s (3.2807e+06 traj/s); 712 infosets
+[gpu_cfr] saved 712 infosets -> /tmp/lucy_gpu_1k.dat
+
+[gpu_cfr profile] iters=1000 trajectories=1024000
+  traversal: 65.64 ms total (65.64 us/iter)
+  match:     92.38 ms total (92.38 us/iter)
+  sync:      154.06 ms total
+[lucy] elapsed 0.48s
+[lucy] saved -> /tmp/lucy_gpu_1k.dat
+
+=== bigger: GPU 100 iters, 4096 traj ===
+[equity] loaded bucket_boundaries.dat: 199/199/199 cutoffs (flop/turn/river)
+[equity] loaded equity_buckets.dat: 200/200/200 EHS² centroids (flop/turn/river)
+[lucy-gpu] 100 iters x 4096 traj/iter = 409600 trajectories in 0.0381625s (1.07331e+07 traj/s); 707 infosets
+[gpu_cfr] saved 707 infosets -> /tmp/lucy_gpu_4k.dat
+
+[gpu_cfr profile] iters=100 trajectories=409600
+  traversal: 1.31 ms total (13.06 us/iter)
+  match:     0.18 ms total (1.84 us/iter)
+  sync:      36.67 ms total
+[lucy] elapsed 0.20s
+[lucy] saved -> /tmp/lucy_gpu_4k.dat
+
+=== CPU baseline 100 iters (no batching) for comparison ===
+[lucy] iter 75/100 nodes=538
+[lucy] iter 80/100 nodes=561
+[lucy] iter 85/100 nodes=586
+[lucy] iter 90/100 nodes=603
+[lucy] iter 95/100 nodes=636
+[lucy] training complete: 100 iterations, 669 infosets
+[lucy] elapsed 0.15s
+[lucy] saved -> /tmp/lucy_cpu_smoke.dat
