@@ -43,14 +43,20 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 # Pick the kernel backend: real CUDA when available, CPU fallback otherwise.
 if(CMAKE_CUDA_COMPILER)
-    target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels.cu)
+    target_sources(${PROJECT_NAME} PRIVATE
+        src/cuda/cuda_kernels.cu
+        src/cuda/gpu_cfr.cu                # GPU-resident CFR traversal kernel
+    )
     set_target_properties(${PROJECT_NAME} PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
     )
 else()
-    target_sources(${PROJECT_NAME} PRIVATE src/cuda/cuda_kernels_cpu.cpp)
+    target_sources(${PROJECT_NAME} PRIVATE
+        src/cuda/cuda_kernels_cpu.cpp
+        src/cuda/gpu_cfr_cpu_stub.cpp     # No-op stub when nvcc unavailable
+    )
 endif()
 
 # Bucket-boundaries builder — V2 abstraction (OMP-value quantile cuts).

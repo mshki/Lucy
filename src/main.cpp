@@ -1,5 +1,6 @@
 #include "../include/game_state.h"
 #include "../include/mccfr/trainer.h"
+#include "../include/cuda/gpu_cfr.h"
 #include "../include/external/json.hpp"
 #include <chrono>
 #include <cmath>
@@ -420,7 +421,10 @@ struct Args {
   // MCCFR sampler — "external" or "outcome".
   std::string sampler = "external";
   double outcome_epsilon = 0.6;
-
+  // Compute device — "cpu" (the default) or "gpu" (uses gpu_cfr engine,
+  // GPU-resident outcome-sampling MCCFR with V1 hand abstraction).
+  std::string device = "cpu";
+  int gpu_traj_per_iter = 4096;
 };
 
 static void print_usage() {
@@ -454,6 +458,8 @@ static void print_usage() {
 
     "  --sampler S            MCCFR sampler: external|outcome  (default external)\n"
     "  --outcome-epsilon E    Exploration mixing for outcome-sampling (default 0.6)\n"
+    "  --device D             cpu|gpu  (default cpu; gpu = GPU-resident outcome-sampling)\n"
+    "  --gpu-traj N           Trajectories per GPU iteration (default 4096)\n"
 
     "\n";
 }
@@ -504,6 +510,8 @@ static Args parse_args(int argc, char **argv) {
 
     else if (s == "--sampler")      a.sampler = next("--sampler");
     else if (s == "--outcome-epsilon") a.outcome_epsilon = std::stod(next("--outcome-epsilon"));
+    else if (s == "--device")       a.device = next("--device");
+    else if (s == "--gpu-traj")     a.gpu_traj_per_iter = std::stoi(next("--gpu-traj"));
 
     else if (s == "-h" || s == "--help") { print_usage(); std::exit(0); }
     else {
@@ -554,13 +562,55 @@ int main(int argc, char *argv[]) {
 
   if (a.cmd == Args::Cmd::TRAIN) {
     auto t0 = std::chrono::steady_clock::now();
-    trainer.train(a.iterations, a.players, a.seed, a.abstraction,
-                  a.randomize_config, a.stack_bb, a.sb, a.bb);
+
+    if (a.device == "gpu") {
+      // GPU-resident outcome-sampling MCCFR. V1 hand abstraction + FCPA
+      // betting only in v0.5; richer abstractions are CPU-only for now.
+      gpu_cfr::GpuCfrConfig gcfg;
+      gcfg.num_players      = a.players;
+      gcfg.small_blind      = a.sb;
+      gcfg.big_blind        = a.bb;
+      gcfg.starting_stack   = a.stack_bb * a.bb;
+      gcfg.epsilon          = a.outcome_epsilon;
+      gcfg.batch_size       = a.gpu_traj_per_iter;
+      // Map --cfr-variant to DCFR knobs (match CPU side).
+      if (a.cfr_variant == "vanilla") {
+        gcfg.dcfr_alpha = 1e30; gcfg.dcfr_beta = 1e30; gcfg.dcfr_gamma = 0.0;
+      } else if (a.cfr_variant == "linear") {
+        gcfg.dcfr_alpha = 1e30; gcfg.dcfr_beta = 1e30; gcfg.dcfr_gamma = 1.0;
+      } else if (a.cfr_variant == "plus") {
+        gcfg.dcfr_alpha = 1e30; gcfg.dcfr_beta = -1e30; gcfg.dcfr_gamma = 1.0;
+      } else /* dcfr */ {
+        gcfg.dcfr_alpha = 1.5; gcfg.dcfr_beta = 0.0; gcfg.dcfr_gamma = 2.0;
+      }
+
+      auto *eng = gpu_cfr::gpu_cfr_create(gcfg);
+      if (!eng) {
+        std::cerr << "[lucy] --device gpu requested but engine creation "
+                  << "failed (no CUDA?). Aborting.\n";
+        return 1;
+      }
+      uint64_t seed64 = a.seed != 0 ? (uint64_t)a.seed : 0xCAFEBABEDEADBEEFULL;
+      double secs_dev = gpu_cfr::gpu_cfr_train(eng, a.iterations, seed64);
+      int n_info = gpu_cfr::gpu_cfr_num_infosets(eng);
+      std::cerr << "[lucy-gpu] " << a.iterations << " iters x "
+                << gcfg.batch_size << " traj/iter = "
+                << ((long long)a.iterations * gcfg.batch_size)
+                << " trajectories in " << secs_dev << "s ("
+                << ((long long)a.iterations * gcfg.batch_size / secs_dev)
+                << " traj/s); " << n_info << " infosets\n";
+      gpu_cfr::gpu_cfr_save(eng, a.out_path);
+      gpu_cfr::gpu_cfr_destroy(eng);
+    } else {
+      trainer.train(a.iterations, a.players, a.seed, a.abstraction,
+                    a.randomize_config, a.stack_bb, a.sb, a.bb);
+      trainer.save_to_file(a.out_path);
+    }
+
     auto t1 = std::chrono::steady_clock::now();
     auto secs = std::chrono::duration<double>(t1 - t0).count();
     std::cerr << "[lucy] elapsed " << std::fixed << std::setprecision(2)
               << secs << "s\n";
-    trainer.save_to_file(a.out_path);
     std::cerr << "[lucy] saved -> " << a.out_path << "\n";
     return 0;
   }
