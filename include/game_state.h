@@ -57,6 +57,9 @@ enum class HandAbstraction {
                           // trained models load directly into CPU serve mode.
   V2_VALUE_QUANTILES,
   V3_EHS_CLUSTERS,
+  V3_IR,                  // V3 buckets + IR keys + no suit-canonical signature
+                          // + fixed stack_bucket=3 (matches GPU V3 emit). Use
+                          // this in --serve mode to load GPU-trained V3 models.
 };
 
 // Minimal player struct for MCCFR

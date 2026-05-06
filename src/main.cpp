@@ -280,6 +280,7 @@ static int serve_mode(Trainer &trainer, BettingAbstraction abs,
             << (abs == BettingAbstraction::FCPA ? "fcpa" : "legacy")
             << " hand="
             << (hand_abs == HandAbstraction::V3_EHS_CLUSTERS ? "v3"
+                : hand_abs == HandAbstraction::V3_IR ? "v3ir"
                 : hand_abs == HandAbstraction::V2_VALUE_QUANTILES ? "v2"
                 : hand_abs == HandAbstraction::V1_IR ? "v1ir"
                 : "v1")
@@ -445,7 +446,7 @@ static void print_usage() {
     "                         legacy      = 5-bet-size old default (0.33p..2p,allin)\n"
     "                         fcpa        = OpenSpiel-compat 4-action {fold,call,pot,allin}\n"
     "                         street-rich = Slumbot-style street-specific 5-7 actions\n"
-    "  --hand-abstraction H   v1|v1ir|v2|v3  (default v1)\n"
+    "  --hand-abstraction H   v1|v1ir|v2|v3|v3ir  (default v1; use v1ir/v3ir for GPU model serve)\n"
     "                         v1   = legacy 10-bucket heuristic + suit-canonical sig\n"
     "                         v1ir = 10-bucket + IR keys (loads GPU-trained models)\n"
     "                         v2   = OMP-value quantile, 169/200/200/200 per street\n"
@@ -501,6 +502,7 @@ static Args parse_args(int argc, char **argv) {
       else if (v == "v1ir") a.hand_abstraction = HandAbstraction::V1_IR;
       else if (v == "v2")   a.hand_abstraction = HandAbstraction::V2_VALUE_QUANTILES;
       else if (v == "v3")   a.hand_abstraction = HandAbstraction::V3_EHS_CLUSTERS;
+      else if (v == "v3ir") a.hand_abstraction = HandAbstraction::V3_IR;
       else { std::cerr << "unknown hand-abstraction: " << v << "\n"; std::exit(2); }
     }
     else if (s == "--randomize-config") a.randomize_config = true;
