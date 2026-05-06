@@ -112,6 +112,17 @@ public:
                         const std::vector<Card> &board_cards, street st,
                         int n_rollouts = 100) const;
 
+  // V3 GPU-compatible variant. Uses the same algorithm as the GPU device
+  // (xoroshiro128+ PRNG, integer-categorical 7-card eval, partial Fisher-
+  // Yates over 52-card deck) so identical (hole, board) inputs produce
+  // bit-identical EHS² values to the GPU's dev_compute_ehs2 — eliminating
+  // the bucket drift that would otherwise break GPU-trained V3 model
+  // serving from CPU. Used by HandAbstraction::V3_IR.
+  int bucketize_hand_v3_gpu_compatible(const std::vector<Card> &hero_hand,
+                                       const std::vector<Card> &board_cards,
+                                       street st,
+                                       int n_rollouts = 50) const;
+
   // Canonical suit-isomorphic signature for information sets
   std::string canonical_state_signature(const std::vector<Card> &hero_hand,
                                         const std::vector<Card> &board_cards) const;

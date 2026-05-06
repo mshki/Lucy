@@ -286,8 +286,13 @@ string GameState::compute_information_set(int player_id) {
 
   int bucket = 0;
   if (equity_module && p->hole_cards.size() >= 2) {
-    if (hand_abstraction == HandAbstraction::V3_EHS_CLUSTERS
-        || hand_abstraction == HandAbstraction::V3_IR) {
+    if (hand_abstraction == HandAbstraction::V3_IR) {
+      // V3_IR uses the GPU-compatible algorithm so CPU --serve produces
+      // bit-identical EHS² values to GPU training, eliminating bucket drift.
+      int per_street = equity_module->bucketize_hand_v3_gpu_compatible(
+          p->hole_cards, community_cards, st);
+      bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);
+    } else if (hand_abstraction == HandAbstraction::V3_EHS_CLUSTERS) {
       int per_street = equity_module->bucketize_hand_v3(p->hole_cards,
                                                         community_cards, st);
       bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);

@@ -252,6 +252,276 @@ int EquityModule::bucketize_hand_v3(const std::vector<Card> &hero_hand,
   return nearest_centroid(ehs2, *centroids);
 }
 
+// ============================================================================
+// GPU-compatible V3 bucketing.
+//
+// The GPU's dev_compute_ehs2 + dev_eval_7card_total uses xoroshiro128+ as its
+// PRNG and a hand-rolled 32-bit total-ordering 7-card evaluator. The default
+// `compute_ehs2_runtime` above uses std::mt19937_64 + OMPEval. For the same
+// (hole, board) input both algorithms compute statistically equivalent EHS²
+// values, but their per-rollout random draws differ → bit-identical
+// reproduction is impossible without using the same algorithm on both sides.
+//
+// Without bit-identical reproduction, ~10–30% of borderline hands end up in
+// different K-means clusters between CPU and GPU, which means CPU --serve
+// loading a GPU-trained V3 model produces a per-query info-set string that
+// often DOESN'T MATCH any key in the model → uniform fallback. The result is
+// V3 GPU plays significantly weaker than V1 GPU when served from CPU, even
+// though the GPU model itself is well-trained.
+//
+// The fix below ports the exact GPU device algorithm to host code:
+//   * xoroshiro128+ PRNG seeded identically (FNV-1a from cards)
+//   * Same partial Fisher-Yates shuffle (`u % (n_remaining - i)` index)
+//   * Same 32-bit total-ordering evaluator (categorical 1..9 + kicker pack)
+//
+// Used by HandAbstraction::V3_IR mode in compute_information_set.
+// ============================================================================
+
+namespace {
+
+// xoroshiro128+ — identical to dev_next_u64 in src/cuda/gpu_cfr.cu.
+struct HRng { uint64_t s0, s1; };
+
+inline uint64_t hr_rotl(uint64_t x, int k) {
+  return (x << k) | (x >> (64 - k));
+}
+inline uint64_t hr_next_u64(HRng &r) {
+  uint64_t s0 = r.s0, s1 = r.s1;
+  uint64_t result = s0 + s1;
+  s1 ^= s0;
+  r.s0 = hr_rotl(s0, 55) ^ s1 ^ (s1 << 14);
+  r.s1 = hr_rotl(s1, 36);
+  return result;
+}
+
+// FNV-1a 64-bit seed — matches dev_ehs2_seed exactly.
+inline uint64_t hr_ehs2_seed(uint8_t hole0, uint8_t hole1,
+                              const uint8_t *board, int num_board) {
+  uint64_t s = 0xcbf29ce484222325ULL;
+  s ^= (uint64_t)hole0; s *= 0x100000001b3ULL;
+  s ^= (uint64_t)hole1; s *= 0x100000001b3ULL;
+  for (int i = 0; i < num_board; ++i) {
+    s ^= (uint64_t)board[i];
+    s *= 0x100000001b3ULL;
+  }
+  return s;
+}
+
+// Total-ordering 7-card hand evaluator — identical to dev_eval_7card_total.
+// Returns a 32-bit value where higher = stronger; bits 24..27 = category
+// 1..9, bits 4..23 = up to 5 kicker ranks × 4 bits.
+inline uint32_t hr_eval_7card_total(const uint8_t *cards, int num_cards) {
+  int rank_count[13] = {0};
+  uint16_t suit_mask[4] = {0, 0, 0, 0};
+  for (int i = 0; i < num_cards; ++i) {
+    int r = cards[i] >> 2;
+    int s = cards[i] & 3;
+    rank_count[r] += 1;
+    suit_mask[s] |= (uint16_t)(1u << r);
+  }
+
+  int flush_suit = -1;
+  for (int s = 0; s < 4; ++s) {
+    int popcount = 0;
+    for (int b = 0; b < 13; ++b) if (suit_mask[s] & (1u << b)) popcount++;
+    if (popcount >= 5) { flush_suit = s; break; }
+  }
+
+  uint16_t any_rank = 0;
+  for (int r = 0; r < 13; ++r)
+    if (rank_count[r] > 0) any_rank |= (uint16_t)(1u << r);
+
+  int top_straight = -1;
+  for (int top = 12; top >= 4; --top) {
+    uint16_t window = (uint16_t)(0x1Fu << (top - 4));
+    if ((any_rank & window) == window) { top_straight = top; break; }
+  }
+  if (top_straight < 0 && (any_rank & 0x100Fu) == 0x100Fu) top_straight = 3;
+
+  int top_sflush = -1;
+  if (flush_suit >= 0) {
+    uint16_t fmask = suit_mask[flush_suit];
+    for (int top = 12; top >= 4; --top) {
+      uint16_t window = (uint16_t)(0x1Fu << (top - 4));
+      if ((fmask & window) == window) { top_sflush = top; break; }
+    }
+    if (top_sflush < 0 && (fmask & 0x100Fu) == 0x100Fu) top_sflush = 3;
+  }
+
+  auto pack = [](int cat, int r0, int r1, int r2, int r3, int r4) -> uint32_t {
+    return ((uint32_t)cat << 24) |
+           ((uint32_t)(r0 & 0xF) << 20) |
+           ((uint32_t)(r1 & 0xF) << 16) |
+           ((uint32_t)(r2 & 0xF) << 12) |
+           ((uint32_t)(r3 & 0xF) << 8)  |
+           ((uint32_t)(r4 & 0xF) << 4);
+  };
+
+  if (top_sflush >= 0) return pack(9, top_sflush, 0, 0, 0, 0);
+
+  int quads_rank = -1, trips_rank = -1, second_trips_rank = -1;
+  int top_pair = -1, second_pair = -1;
+  for (int r = 12; r >= 0; --r) {
+    int c = rank_count[r];
+    if (c == 4) { if (quads_rank < 0) quads_rank = r; }
+    else if (c == 3) {
+      if (trips_rank < 0) trips_rank = r;
+      else if (second_trips_rank < 0) second_trips_rank = r;
+    }
+    else if (c == 2) {
+      if (top_pair < 0) top_pair = r;
+      else if (second_pair < 0) second_pair = r;
+    }
+  }
+
+  if (quads_rank >= 0) {
+    int kicker = -1;
+    for (int r = 12; r >= 0; --r)
+      if (r != quads_rank && rank_count[r] >= 1) { kicker = r; break; }
+    return pack(8, quads_rank, kicker, 0, 0, 0);
+  }
+
+  if (trips_rank >= 0 && (second_trips_rank >= 0 || top_pair >= 0)) {
+    int pair_rank;
+    if (second_trips_rank >= 0 && (top_pair < 0 || second_trips_rank > top_pair))
+      pair_rank = second_trips_rank;
+    else
+      pair_rank = top_pair;
+    return pack(7, trips_rank, pair_rank, 0, 0, 0);
+  }
+
+  if (flush_suit >= 0) {
+    uint16_t fmask = suit_mask[flush_suit];
+    int r[5] = {0, 0, 0, 0, 0};
+    int kept = 0;
+    for (int rr = 12; rr >= 0 && kept < 5; --rr) {
+      if (fmask & (uint16_t)(1u << rr)) { r[kept++] = rr; }
+    }
+    return pack(6, r[0], r[1], r[2], r[3], r[4]);
+  }
+
+  if (top_straight >= 0) return pack(5, top_straight, 0, 0, 0, 0);
+
+  if (trips_rank >= 0) {
+    int k0 = -1, k1 = -1;
+    for (int r = 12; r >= 0; --r) {
+      if (r != trips_rank && rank_count[r] >= 1) {
+        if (k0 < 0) k0 = r;
+        else if (k1 < 0) { k1 = r; break; }
+      }
+    }
+    return pack(4, trips_rank, k0, k1, 0, 0);
+  }
+
+  if (top_pair >= 0 && second_pair >= 0) {
+    int k0 = -1;
+    for (int r = 12; r >= 0; --r) {
+      if (r != top_pair && r != second_pair && rank_count[r] >= 1) {
+        k0 = r; break;
+      }
+    }
+    return pack(3, top_pair, second_pair, k0, 0, 0);
+  }
+
+  if (top_pair >= 0) {
+    int k[3] = {-1, -1, -1};
+    int kept = 0;
+    for (int r = 12; r >= 0 && kept < 3; --r) {
+      if (r != top_pair && rank_count[r] >= 1) k[kept++] = r;
+    }
+    return pack(2, top_pair, k[0], k[1], k[2], 0);
+  }
+
+  int r[5] = {0, 0, 0, 0, 0};
+  int kept = 0;
+  for (int rr = 12; rr >= 0 && kept < 5; --rr) {
+    if (rank_count[rr] >= 1) r[kept++] = rr;
+  }
+  return pack(1, r[0], r[1], r[2], r[3], r[4]);
+}
+
+// Host-side EHS² rollout — bit-for-bit identical to dev_compute_ehs2.
+inline double hr_compute_ehs2(uint8_t hole0, uint8_t hole1,
+                               const uint8_t *board, int num_board,
+                               int n_rollouts) {
+  uint8_t deck[52];
+  bool used[52] = {false};
+  used[hole0] = true;
+  used[hole1] = true;
+  for (int i = 0; i < num_board; ++i) used[board[i]] = true;
+  int n_deck = 0;
+  for (int c = 0; c < 52; ++c) if (!used[c]) deck[n_deck++] = (uint8_t)c;
+
+  int board_needed = 5 - num_board;
+  int k = 2 + board_needed;
+
+  uint64_t seed = hr_ehs2_seed(hole0, hole1, board, num_board);
+  HRng rng;
+  rng.s0 = seed ^ 0x9E3779B97F4A7C15ULL;
+  rng.s1 = seed * 0xBF58476D1CE4E5B9ULL ^ 0xC2B2AE3D27D4EB4FULL;
+
+  uint8_t hero[7];
+  uint8_t opp[7];
+  hero[0] = hole0; hero[1] = hole1;
+  for (int i = 0; i < num_board; ++i) hero[2 + i] = board[i];
+
+  double sum_sq = 0.0;
+  for (int r = 0; r < n_rollouts; ++r) {
+    for (int i = 0; i < k; ++i) {
+      uint64_t u = hr_next_u64(rng);
+      int j = i + (int)(u % (uint64_t)(n_deck - i));
+      uint8_t tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+    }
+    opp[0] = deck[0]; opp[1] = deck[1];
+    for (int i = 0; i < num_board; ++i) opp[2 + i] = board[i];
+    for (int i = 0; i < board_needed; ++i) {
+      hero[2 + num_board + i] = deck[2 + i];
+      opp [2 + num_board + i] = deck[2 + i];
+    }
+    int n_full = 2 + num_board + board_needed;
+    uint32_t hv = hr_eval_7card_total(hero, n_full);
+    uint32_t ov = hr_eval_7card_total(opp,  n_full);
+    double score = (hv > ov) ? 1.0 : ((hv == ov) ? 0.5 : 0.0);
+    sum_sq += score * score;
+  }
+  return sum_sq / (double)n_rollouts;
+}
+
+} // anonymous namespace
+
+int EquityModule::bucketize_hand_v3_gpu_compatible(
+    const std::vector<Card> &hero_hand,
+    const std::vector<Card> &board_cards,
+    street st, int n_rollouts) const {
+  if (hero_hand.size() < 2) return 0;
+  if (st == PRE || board_cards.empty()) {
+    return preflop_canonical_index(hero_hand[0], hero_hand[1]);
+  }
+  const std::vector<double> *centroids = nullptr;
+  switch (st) {
+  case FLOP:  centroids = &flop_ehs_centroids_;  break;
+  case TURN:  centroids = &turn_ehs_centroids_;  break;
+  case RIVER: centroids = &river_ehs_centroids_; break;
+  default:    return 0;
+  }
+  if (centroids->empty()) {
+    return bucketize_hand_v2(hero_hand, board_cards, st);
+  }
+
+  // Pack hole + board into uint8_t arrays (rank * 4 + suit, identical to
+  // GPU's DGameState card encoding).
+  uint8_t hole0 = (uint8_t)((int)hero_hand[0].rank * 4 + (int)hero_hand[0].suit);
+  uint8_t hole1 = (uint8_t)((int)hero_hand[1].rank * 4 + (int)hero_hand[1].suit);
+  uint8_t board[5] = {0};
+  int num_board = 0;
+  for (const auto &c : board_cards) {
+    if (num_board < 5)
+      board[num_board++] = (uint8_t)((int)c.rank * 4 + (int)c.suit);
+  }
+  double ehs2 = hr_compute_ehs2(hole0, hole1, board, num_board, n_rollouts);
+  return nearest_centroid(ehs2, *centroids);
+}
+
 int EquityModule::bin_index(int v, const std::vector<int> &cutoffs,
                             int n_bins) {
   if (cutoffs.empty()) {
