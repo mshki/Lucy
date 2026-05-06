@@ -1,5 +1,7 @@
 #include "cuda/cuda_kernels.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -86,13 +88,31 @@ __global__ void update_regret_sum_kernel(double *regret_sum,
 
 void launch_apply_regret_deltas(std::vector<double> &host_regret_sum,
                                 const std::vector<double> &host_deltas,
-                                int n_rows, int max_actions) {
+                                int n_rows, int max_actions,
+                                int iteration, DcfrParams dcfr) {
   size_t total = static_cast<size_t>(n_rows) * max_actions;
   if (host_regret_sum.size() != total || host_deltas.size() != total) {
     throw std::invalid_argument("launch_apply_regret_deltas: size mismatch");
   }
   if (total == 0)
     return;
+  // Apply DCFR discount on host first (small math, doesn't dominate cost)
+  // before shipping to device. Match cuda_kernels_cpu.cpp behaviour.
+  double t = std::max(1.0, (double)iteration);
+  auto disc = [t](double p) {
+    if (p >= 1e29) return 1.0;
+    if (p <= -1e29) return 0.0;
+    double tp = std::pow(t, p);
+    if (!std::isfinite(tp)) return 1.0;
+    return tp / (tp + 1.0);
+  };
+  double dpos = disc(dcfr.alpha), dneg = disc(dcfr.beta);
+  if (dpos != 1.0 || dneg != 1.0) {
+    for (size_t i = 0; i < total; ++i) {
+      double r = host_regret_sum[i];
+      host_regret_sum[i] = (r > 0.0) ? r * dpos : r * dneg;
+    }
+  }
 
   size_t bytes = total * sizeof(double);
 
@@ -125,7 +145,8 @@ void launch_regret_match(const std::vector<double> &host_regret_sum,
                          std::vector<double> &host_strategy_sum,
                          const std::vector<int> &host_num_actions,
                          const std::vector<double> &host_realization_weights,
-                         int n_rows, int max_actions) {
+                         int n_rows, int max_actions,
+                         int iteration, DcfrParams dcfr) {
   size_t mat = static_cast<size_t>(n_rows) * max_actions;
   if (host_regret_sum.size() != mat || host_strategy.size() != mat ||
       host_strategy_sum.size() != mat ||
@@ -135,6 +156,13 @@ void launch_regret_match(const std::vector<double> &host_regret_sum,
   }
   if (n_rows == 0)
     return;
+  // DCFR strategy_sum γ-discount applied before kernel (cheap math).
+  double t = std::max(1.0, (double)iteration);
+  double sw = (dcfr.gamma == 0.0) ? 1.0 : std::pow(t / (t + 1.0), dcfr.gamma);
+  if (sw != 1.0) {
+    for (size_t i = 0; i < mat; ++i) host_strategy_sum[i] *= sw;
+  }
+  (void)iteration;
 
   size_t mat_bytes = mat * sizeof(double);
   size_t row_bytes = static_cast<size_t>(n_rows) * sizeof(double);

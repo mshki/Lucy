@@ -388,12 +388,15 @@ __device__ inline int dev_hash_lookup_or_insert(DHashTable ht, uint64_t key) {
   int idx = (int)(h & (uint64_t)ht.capacity_mask);
   for (int probe = 0; probe < 64; ++probe) {
     int slot = (idx + probe) & ht.capacity_mask;
-    uint64_t cur = ht.keys[slot];
+    // Atomic load of keys[slot] (CAS with same-value is a no-op load).
+    uint64_t cur = atomicCAS((unsigned long long *)&ht.keys[slot], 0ULL, 0ULL);
     if (cur == key) {
       // Already exists — return its value. value may be -1 if a peer is in
-      // the middle of allocating; spin briefly.
-      int v = ht.values[slot];
-      while (v < 0) v = ht.values[slot]; // benign spin
+      // the middle of allocating; spin via atomicAdd-0 to bypass cache.
+      int v;
+      while ((v = atomicAdd((int *)&ht.values[slot], 0)) < 0) {
+        // benign spin until the inserter publishes the row id
+      }
       return v;
     }
     if (cur == 0ULL) {
@@ -404,20 +407,19 @@ __device__ inline int dev_hash_lookup_or_insert(DHashTable ht, uint64_t key) {
       if (prev == 0ULL) {
         // Claimed. Allocate row.
         int row = atomicAdd(ht.size, 1);
-        ht.values[slot] = row;
+        // atomicExch makes the write visible immediately to other threads.
+        atomicExch((int *)&ht.values[slot], row);
         return row;
       }
       if (prev == key) {
-        int v = ht.values[slot];
-        while (v < 0) v = ht.values[slot];
+        int v;
+        while ((v = atomicAdd((int *)&ht.values[slot], 0)) < 0) {}
         return v;
       }
       // Some other thread took this slot for a different key — keep probing.
     }
   }
-  // Hash table full or extreme contention. Should not happen at our
-  // capacity (16M slots vs ~1M expected info-sets). Return -1 to signal
-  // failure; caller falls back to uniform.
+  // Hash table full or extreme contention. Caller falls back to uniform.
   return -1;
 }
 

@@ -55,10 +55,13 @@ constexpr int kMaxActions = 4;
 // with 6 raises per street caps at ~24 player actions plus ~4 chance nodes.
 constexpr int kMaxDepth = 32;
 
-// Hash-table capacity. Power of 2. 1<<24 = 16,777,216 slots → ~192MB hash +
-// ~1.5GB regret/strategy tables at MAX_ACTIONS=4. Sized for full HU NLHE
-// FCPA + V1 + imperfect-recall key space.
-constexpr int kHashCapacityLog2 = 24;
+// Hash-table capacity. Power of 2. 1<<19 = 524,288 slots is plenty for HU
+// NLHE FCPA + V1 hand abstraction + imperfect-recall keys (typical info-set
+// count under this abstraction is well under 100k). Memory: ~6 MB hash +
+// ~50 MB regret/strategy tables at MAX_ACTIONS=4. Cheap and the
+// regret-match kernel only loops over this many rows per iteration —
+// keeping it small is what makes the per-iter wallclock competitive.
+constexpr int kHashCapacityLog2 = 19;
 constexpr int kHashCapacity = 1 << kHashCapacityLog2;
 
 // Configuration for one training run.
