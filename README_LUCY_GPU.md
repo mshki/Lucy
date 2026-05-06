@@ -84,14 +84,108 @@ reference solver at the same training budget.
 The bot was trained at the **FCPA action abstraction** (only 4 bet sizes:
 fold / call / pot / all-in) and **V1 hand bucketing** (10 abstract hand
 strengths). Those are the simplest options. Stronger play is gated by:
-- V3 EHS² hand bucketing on device (~1,500 mbb/h closer to optimal —
-  already implemented on CPU, deferred on GPU because it needs nested
-  Monte Carlo rollouts inside the trajectory kernel)
+- ~~V3 EHS² hand bucketing on device~~ — **DONE in v0.6**, see section 2.5
 - STREET_RICH bet sizing (5–7 actions per street: 0.33p/0.66p/p/2p/allin
   etc — already implemented on CPU, deferred on GPU because variable
   per-state action count complicates the trajectory buffer)
 - River subgame re-solving (Pluribus-style real-time depth-limited
   search — would buy 200–500 mbb/h)
+
+## 2.5. v0.6: V3 EHS² on GPU — biggest playing-strength upgrade so far
+
+The headline-strength gap between Lucy v1 GPU and OpenSpiel was eaten by
+V3. **At 200K iters of V3 training (1.6B trajectories in 14.6 minutes),
+Lucy GPU loses to OpenSpiel @ 1M by only 315 mbb/hand**, with a 95% CI
+that comfortably crosses zero. That's the strongest Lucy ever shipped:
+
+| Bot | vs OpenSpiel @ 1M (n=2,000) | mbb/hand | 95% CI | Notes |
+|---|---:|---:|---:|---|
+| Lucy v0.1 (orig CPU recursive) | n=15,000 | −3,589 | [−4,210, −2,967] | Original CPU Lucy |
+| Lucy v1 GPU (V1 buckets, 50K×8K = 410M traj) | n=2,000 | −1,121 | [−2,877, +634] | v0.5 |
+| **Lucy v0.6 GPU (V3 EHS², 200K×8K = 1.6B traj)** | **n=2,000** | **−315** | **[−2,207, +1,577]** | **v0.6 (this section)** |
+| Lucy v0.4 CPU (V3 EHS² + DCFR @ 1M iters) | n=2,000 | −1,266 | [−2,888, −38] | CPU V3, ~7 hours train |
+
+**Trajectory: from −3,589 → −1,121 → −315 mbb/h**, and from 7+ hours of
+CPU compute → 14.6 minutes of GPU compute.
+
+### Throughput cost of V3
+
+V3 runs ~12× slower per trajectory than V1 because each node visit now
+does a Monte Carlo EHS² rollout (50 rollouts × 2 evals × ~80 ALU ops per
+eval, all on device) instead of the V1 heuristic 10-bucket lookup:
+
+| Workload | V1 GPU | V3 GPU | Cost |
+|---|---:|---:|---:|
+| Per-trajectory throughput | 22 M traj/s | 1.8 M traj/s | 12× slower |
+| 410 M trajectories | 18.6 sec | ~228 sec | OK |
+| 1.6 B trajectories | n/a (didn't train) | 875 sec | Practical |
+| info-sets discovered | ~7,000 | ~140,000 | 20× richer |
+
+So V3 still trains *much* faster than CPU — at 1.8M traj/s the 14.6-min
+run is ~3,500× the per-trajectory throughput of Lucy v0.1 CPU
+(15K traj/s) and ~36× the throughput of OpenSpiel's
+`OutcomeSamplingMCCFRSolver` (50K iter/s).
+
+### What changed at the code level (CPU → GPU porting of V3)
+
+V3 needs three things on device that the V1 path didn't:
+
+1. **A real 7-card poker evaluator with total ordering**
+   (`dev_eval_7card_total` in `gpu_cfr.cu`). The existing
+   `dev_eval_category` returned a category 1..9 (high card .. straight
+   flush) which was fine for V1's coarse bucketing but tied any two
+   flushes / two pairs at showdown. For EHS² rollouts (where each
+   rollout's outcome is win / tie / loss vs a sampled opponent) we need
+   accurate kicker comparisons — the new evaluator returns a 32-bit
+   value `[category:4][rank0:4][rank1:4][rank2:4][rank3:4][rank4:4]`
+   that orders any two hands correctly. ~80 ALU ops, no LUT memory,
+   warp-friendly.
+
+2. **A Monte-Carlo EHS² rollout in the trajectory kernel**
+   (`dev_compute_ehs2`). Deterministically seeded via FNV-1a from
+   `(hole, board)` so the same hand always produces the same EHS² across
+   CFR iterations (consistent regret accumulation). Per call: 50
+   rollouts of partial Fisher-Yates over the remaining deck + 2 ×
+   `dev_eval_7card_total`. ~9,000 ALU ops per query.
+
+3. **A nearest-centroid lookup over the V3 K-means table**
+   (`dev_nearest_centroid_d`). Centroids loaded from the existing
+   `equity_buckets.dat` (built by the offline `build_equity_buckets`
+   tool) and copied to device global memory at engine create. Binary
+   search over the 200 sorted centroids per street; 8 iterations.
+
+The info-set key bit layout was widened from 4-bit bucket → 8-bit bucket
+to fit V3's 200 buckets per post-flop street. V1 GPU model files saved
+in v0.5 are no longer loadable (regenerable in 20s with the v0.6 binary
+though).
+
+### The bucket-drift bug we hit and fixed
+
+First V3 GPU result was actually *worse* than V1 GPU at 200K iters
+(−1551 mbb/h vs OpenSpiel — pretraining-uniform-fallback level). After
+debugging: the GPU's EHS² rollout uses xoroshiro128+ as its PRNG, but
+CPU's `compute_ehs2_runtime` uses `std::mt19937_64`. Same seed, different
+PRNG → different opponent-hand sequences sampled → different EHS²
+values → different K-means cluster assignments for borderline hands
+(estimated ~10–30% of all hands).
+
+Effect: when CPU `--serve` reads a GPU-saved V3 model, it computes
+info-set keys using its own (mt19937) bucketing, which doesn't match
+the (xoroshiro128+) buckets stored in the model file. Lookup fails
+→ uniform-random fallback at the table → bot plays badly. **Training
+longer didn't help** — the 50% of hands that miss stay broken.
+
+The fix: `EquityModule::bucketize_hand_v3_gpu_compatible` (`equity.cpp`)
+is a host port of the exact GPU device algorithm — same PRNG, same
+deterministic seed, same partial Fisher-Yates, same evaluator. Bit-for-
+bit identical EHS² values to GPU for any input. `HandAbstraction::V3_IR`
+mode (the GPU-model-compat hand abstraction) routes through this
+variant. No more drift; CPU `--serve` lookups now hit reliably.
+
+After the fix, V3 GPU 200K iters jumped from −1551 → **−315 mbb/h** vs
+OpenSpiel. That's the headline number. The fix is a textbook example of
+"deterministic algorithms must be bit-identical when training and
+inference happen in different processes / on different devices."
 
 ## 3. Live testing — yes, you can play it, with caveats
 
