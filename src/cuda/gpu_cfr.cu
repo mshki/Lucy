@@ -302,43 +302,79 @@ __device__ inline uint64_t dev_compute_infoset_key(const DGameState &s,
   uint8_t bucket = dev_bucketize_hand(s, player);
   uint8_t pot_b  = (uint8_t)dev_pot_bucket(s.pot, bb);
 
-  // Walk history once to compute per-street raise count + last raiser.
-  // Streets are inferred by tracking previous_bet=0 resets. For HU FCPA
-  // it's enough to walk history and count raise actions per stage.
-  // Simpler: tag actions by stage via an inferred street index — we
-  // restart the count whenever previous_bet drops to 0 between
-  // consecutive actions. Implementation kept compact: track the
-  // current street index and reset when we see a reset.
+  // Walk history with proper per-street tracking. We don't store street
+  // tags in DGameState.hist directly, so we infer them by counting how
+  // many times the betting round closed before the current state. The
+  // CPU's imperfect_recall_summary uses a similar heuristic.
+  //
+  // Algorithm: track a running "active player count" of who has acted
+  // and the per-player current contribution. When all (non-folded,
+  // non-allin) players have acted AND their bets are equal, the round
+  // closes — bump the street tag. (HU FCPA: 2 players, betting closes
+  // when the second player's action equalises the high bet.)
   uint8_t raise_cnt[4] = {0, 0, 0, 0};
-  uint8_t last_raiser[4] = {0, 0, 0, 0}; // 0=none
+  uint8_t last_raiser[4] = {0, 0, 0, 0}; // 0=none, 1=button, 2=non-button
   int cur_street = 0;
+  uint8_t acted = 0;       // bitmask of players who have acted on this street
+  int8_t  cur_bet[2] = {0, 0};
+  uint8_t folded = 0;
+  uint8_t allin = 0;
+  // Initialise blinds-posted state: in HU, SB at (dealer+1)%2 has posted
+  // SB (1bb) and BB at dealer has posted BB (2bb).
+  int sb_pos = (s.dealer + 1) & 1;
+  int bb_pos = s.dealer;
+  cur_bet[sb_pos] = 1; // small blind in chips (1)
+  cur_bet[bb_pos] = 2; // big blind (2)
+  int8_t high_bet = 2;
+
+  auto round_closed = [&](void) -> bool {
+    for (int p = 0; p < 2; ++p) {
+      if ((folded >> p) & 1) continue;
+      if ((allin  >> p) & 1) continue;
+      if (!((acted >> p) & 1)) return false;
+      if (cur_bet[p] != high_bet) return false;
+    }
+    return true;
+  };
+
   for (int i = 0; i < s.num_hist; ++i) {
     uint8_t entry = s.hist[i];
     int p = entry >> 4;
     int a = entry & 0xF;
-    // Heuristic street advancement: when we see a chance-card-deal would
-    // happen between actions, the encoding bumps cur_street. Since we
-    // don't directly mark this in `hist`, we rely on the entry's action
-    // to be the first action of a new street if the previous action
-    // closed the betting round. Simplification: we treat every "new
-    // betting round closed" point as advance-able. For HU FCPA this is
-    // sufficient because the only state-machine question is "who raised
-    // last on each street".
-    // For now, use action count as stage approximation: this isn't
-    // perfect but matches the CPU heuristic in imperfect_recall_summary
-    // for the cases we care about (HU FCPA outcome sampling).
-    if (a == kActPot || a == kActAllin) {
+    acted |= (uint8_t)(1u << p);
+
+    if (a == kActFold) {
+      folded |= (uint8_t)(1u << p);
+    } else if (a == kActCall) {
+      int call = high_bet - cur_bet[p];
+      if (call > 0) cur_bet[p] = high_bet;
+    } else if (a == kActPot || a == kActAllin) {
       if (raise_cnt[cur_street] < 3) raise_cnt[cur_street] += 1;
-      // 'd' if dealer (button = SB in HU at dealer index), 's' otherwise.
-      // Position-relative encoding: rel = (player - dealer + 2) % 2.
       int rel = (p - s.dealer + 2) % 2;
       last_raiser[cur_street] = (rel == 0) ? 1 : 2;
+      // Estimate the new high bet conservatively: pot raise + allin both
+      // raise the high bet beyond the call amount. Exact chip math doesn't
+      // matter for the round-close detection — we just need cur_bet[p]
+      // to exceed high_bet so the OTHER player's acted bit will need to
+      // be set + their cur_bet equalised before the round closes.
+      cur_bet[p] = high_bet + 1;
+      high_bet = cur_bet[p];
+      if (a == kActAllin) allin |= (uint8_t)(1u << p);
     }
-    // Note: precise street tracking would consult the street tags; the
-    // CPU's imperfect_recall_summary does the same heuristic.
+
+    if (round_closed() && cur_street < 3) {
+      // Bump street; reset acted + cur_bet for the new street.
+      cur_street += 1;
+      acted = 0;
+      cur_bet[0] = 0; cur_bet[1] = 0;
+      high_bet = 0;
+    }
   }
-  // The current state already knows the stage; bound cur_street there.
-  if (s.stage >= kPreflop) cur_street = s.stage - kPreflop;
+  // Bound cur_street to the current stage (defensive).
+  if (s.stage >= kPreflop) {
+    int s_idx = s.stage - kPreflop;
+    if (s_idx > cur_street) cur_street = s_idx;
+  }
 
   uint64_t key = 0;
   key |= (uint64_t)(bucket & 0xF);
@@ -1075,12 +1111,23 @@ GpuCfrProfile gpu_cfr_profile(const GpuCfrEngine *eng) {
   return p;
 }
 
-// Save: dump (size, keys[size], values[size], num_actions[size], strategy_sum[size*K]).
-// All entries beyond `size` are zero so we skip them.
+// Save in CPU-NodeMatrix format so the existing Trainer::load_from_file +
+// serve mode can read GPU-trained models directly. Format (matches
+// trainer.cpp save_to_file):
+//   size_t N
+//   N times: size_t key_len, char[key_len] key, size_t k, double[k] sum
+//
+// We materialise CPU-style string keys by decoding the GPU's packed uint64
+// into the same string format compute_information_set emits for V2/V3
+// hand abstractions:
+//   "<bucket>|_|<stage>|<stack_bucket>|<pot_bucket>|<ir_summary>|<num_legal>|"
+//
+// stack_bucket isn't tracked in the GPU key, so we use a fixed "3" (medium-
+// deep, matches 100bb at the start of a hand). For HU NLHE FCPA training
+// this constant is correct for the entire hand.
 bool gpu_cfr_save(GpuCfrEngine *eng, const std::string &path) {
   if (!eng) return false;
   int sz = gpu_cfr_num_infosets(eng);
-  // Walk hash table host-side to collect (key, row_id) for non-empty slots.
   std::vector<uint64_t> hkeys(kHashCapacity);
   std::vector<int>      hvals(kHashCapacity);
   cudaMemcpy(hkeys.data(), eng->d_keys, kHashCapacity * sizeof(uint64_t),
@@ -1096,29 +1143,69 @@ bool gpu_cfr_save(GpuCfrEngine *eng, const std::string &path) {
   cudaMemcpy(hna.data(), eng->d_num_actions, eng->row_capacity * sizeof(int),
              cudaMemcpyDeviceToHost);
 
-  FILE *f = std::fopen(path.c_str(), "wb");
-  if (!f) return false;
-  uint32_t magic = 0x4C474346u; // 'LGCF' Lucy GPU CFR
-  uint32_t version = 1;
-  std::fwrite(&magic, sizeof(magic), 1, f);
-  std::fwrite(&version, sizeof(version), 1, f);
-  std::fwrite(&sz, sizeof(sz), 1, f);
-
-  // Iterate over occupied slots and dump (key, num_actions, strategy_sum).
+  // Collect occupied (key, row) pairs.
+  std::vector<std::pair<uint64_t, int>> entries;
   for (int i = 0; i < kHashCapacity; ++i) {
     if (hkeys[i] == 0ULL) continue;
     int row = hvals[i];
     if (row < 0 || row >= eng->row_capacity) continue;
-    uint64_t key = hkeys[i];
     int n_act = hna[row];
     if (n_act <= 0) continue;
-    std::fwrite(&key, sizeof(key), 1, f);
-    int32_t na = n_act;
-    std::fwrite(&na, sizeof(na), 1, f);
-    std::fwrite(&hss[(size_t)row * kMaxActions], sizeof(double), kMaxActions, f);
+    entries.emplace_back(hkeys[i], row);
+  }
+
+  FILE *f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+  size_t N = entries.size();
+  std::fwrite(&N, sizeof(N), 1, f);
+
+  // Decode each GPU key into the CPU's V2/V3 string format.
+  static const char *AGGRESSOR = "-ds-"; // 0='-', 1='d', 2='s', 3='-'
+  for (auto &[key, row] : entries) {
+    int bucket    = (int)((key >> 0)  & 0xF);
+    int stage     = (int)((key >> 4)  & 0x7);
+    int pot_b     = (int)((key >> 7)  & 0x7);
+    int rc[4]     = {(int)((key>>10)&0x3), (int)((key>>12)&0x3),
+                     (int)((key>>14)&0x3), (int)((key>>16)&0x3)};
+    int lr[4]     = {(int)((key>>18)&0x3), (int)((key>>20)&0x3),
+                     (int)((key>>22)&0x3), (int)((key>>24)&0x3)};
+    int num_legal = (int)((key >> 26) & 0x3);
+    if (num_legal == 0) num_legal = 4; // we encoded 4 as 0 (& 0x3 collision)
+
+    int cur_street_idx = stage - 1; // stage 1=preflop → idx 0
+    if (cur_street_idx < 0) cur_street_idx = 0;
+    if (cur_street_idx > 3) cur_street_idx = 3;
+
+    // Reconstruct the imperfect_recall_summary string, e.g. "-0,d1,s2,-0".
+    std::string ir;
+    for (int s = 0; s <= cur_street_idx; ++s) {
+      ir += AGGRESSOR[lr[s] & 3];
+      ir += std::to_string(rc[s]);
+      if (s < cur_street_idx) ir += ',';
+    }
+    if (ir.empty()) ir = "_";
+
+    // Format matches game_state.cpp's compute_information_set V2/V3 path:
+    //   "<bucket>|_|<stage>|<stack_bucket>|<pot_bucket>|<ir_summary>|<num_legal>|"
+    // (V2/V3 drop the suit signature, encoded as "_".)
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "%d|_|%d|3|%d|%s|%d|",
+                       bucket, stage, pot_b, ir.c_str(), num_legal);
+    size_t key_len = (size_t)len;
+    std::fwrite(&key_len, sizeof(key_len), 1, f);
+    std::fwrite(buf, 1, key_len, f);
+
+    int n_act = hna[row];
+    size_t k = (size_t)n_act;
+    std::fwrite(&k, sizeof(k), 1, f);
+    // Write only the first n_act entries of the strategy_sum row (CPU side
+    // expects exactly k doubles — the row has kMaxActions=4 slots but
+    // CPU's NodeMatrix stores per-row n_act-sized vectors).
+    std::fwrite(&hss[(size_t)row * kMaxActions], sizeof(double), k, f);
   }
   std::fclose(f);
-  std::fprintf(stderr, "[gpu_cfr] saved %d infosets -> %s\n", sz, path.c_str());
+  std::fprintf(stderr, "[gpu_cfr] saved %zu infosets (CPU-compatible format) -> %s\n",
+               N, path.c_str());
   return true;
 }
 

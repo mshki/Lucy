@@ -295,15 +295,16 @@ string GameState::compute_information_set(int player_id) {
                                                         community_cards, st);
       bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);
     } else {
+      // V1_HEURISTIC_10 and V1_IR both use the heuristic 10-bucket.
       bucket = equity_module->bucketize_hand(p->hole_cards,
                                              community_cards, st);
     }
   }
 
   // V1 includes the suit-canonical signature in the info-set key (huge for
-  // distinguishing strategically equivalent boards). V2 / V3 already encode
-  // hand strength via OMP / EHS² clustering, so we drop the signature to
-  // keep infoset count manageable.
+  // distinguishing strategically equivalent boards). V1_IR / V2 / V3 drop
+  // the signature: V1_IR for GPU-format compat, V2/V3 because OMP /
+  // EHS² clustering already encodes board / hand strength.
   std::string suit_signature = "_";
   if (hand_abstraction == HandAbstraction::V1_HEURISTIC_10
       && equity_module && p->hole_cards.size() >= 2) {
@@ -336,6 +337,10 @@ string GameState::compute_information_set(int player_id) {
   // Abstract stack size to buckets
   double stack_bb = p->stack / bb;
   int stack_bucket = abstract_stack_size(stack_bb);
+  // V1_IR: GPU-CFR engine doesn't track stack_bucket separately; it always
+  // assumes the start-of-hand bucket. Use a fixed "3" (medium-deep, 100bb)
+  // to match the keys the GPU emits.
+  if (hand_abstraction == HandAbstraction::V1_IR) stack_bucket = 3;
   info += std::to_string(stack_bucket) + "|";
   // info += std::to_string(p->stack);
 
