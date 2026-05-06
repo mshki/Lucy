@@ -202,6 +202,255 @@ __device__ inline int dev_eval_category(const uint8_t *cards, int num_cards) {
 }
 
 // ============================================================================
+// V3 EHS² support: full 32-bit total-ordering 7-card evaluator + Monte Carlo
+// rollout + nearest-centroid lookup. Used when cfg.hand_abstraction == V3.
+//
+// The 7-card evaluator returns a 32-bit comparable score (higher = stronger
+// hand). Total ordering matches standard poker rules; ties only occur for
+// genuinely equal-strength hands. The encoding is:
+//   bits 24..27   category (1=high card .. 9=straight flush)
+//   bits 0..23    up to 6 kicker / kept ranks, 4 bits each, top-down
+// Two distinct flushes / two pairs / etc. resolve correctly via kicker bits.
+// ============================================================================
+
+__device__ inline uint32_t
+dev_eval_7card_total(const uint8_t *cards, int num_cards) {
+  int rank_count[13] = {0};
+  uint16_t suit_mask[4] = {0, 0, 0, 0};
+  for (int i = 0; i < num_cards; ++i) {
+    int r = cards[i] >> 2;
+    int s = cards[i] & 3;
+    rank_count[r] += 1;
+    suit_mask[s] |= (uint16_t)(1u << r);
+  }
+
+  int flush_suit = -1;
+  for (int s = 0; s < 4; ++s) {
+    if (__popc(suit_mask[s]) >= 5) { flush_suit = s; break; }
+  }
+
+  uint16_t any_rank = 0;
+  for (int r = 0; r < 13; ++r)
+    if (rank_count[r] > 0) any_rank |= (uint16_t)(1u << r);
+
+  int top_straight = -1;
+  for (int top = 12; top >= 4; --top) {
+    uint16_t window = (uint16_t)(0x1Fu << (top - 4));
+    if ((any_rank & window) == window) { top_straight = top; break; }
+  }
+  if (top_straight < 0 && (any_rank & 0x100Fu) == 0x100Fu) top_straight = 3;
+
+  int top_sflush = -1;
+  if (flush_suit >= 0) {
+    uint16_t fmask = suit_mask[flush_suit];
+    for (int top = 12; top >= 4; --top) {
+      uint16_t window = (uint16_t)(0x1Fu << (top - 4));
+      if ((fmask & window) == window) { top_sflush = top; break; }
+    }
+    if (top_sflush < 0 && (fmask & 0x100Fu) == 0x100Fu) top_sflush = 3;
+  }
+
+  // Pack helper. Cat in bits 24..27, then 5 ranks × 4 bits in 4..23.
+  auto pack = [](int cat, int r0, int r1, int r2, int r3, int r4) -> uint32_t {
+    return ((uint32_t)cat << 24) |
+           ((uint32_t)(r0 & 0xF) << 20) |
+           ((uint32_t)(r1 & 0xF) << 16) |
+           ((uint32_t)(r2 & 0xF) << 12) |
+           ((uint32_t)(r3 & 0xF) << 8)  |
+           ((uint32_t)(r4 & 0xF) << 4);
+  };
+
+  if (top_sflush >= 0) return pack(9, top_sflush, 0, 0, 0, 0);
+
+  int quads_rank = -1, trips_rank = -1, second_trips_rank = -1;
+  int top_pair = -1, second_pair = -1;
+  for (int r = 12; r >= 0; --r) {
+    int c = rank_count[r];
+    if (c == 4) { if (quads_rank < 0) quads_rank = r; }
+    else if (c == 3) {
+      if (trips_rank < 0) trips_rank = r;
+      else if (second_trips_rank < 0) second_trips_rank = r;
+    }
+    else if (c == 2) {
+      if (top_pair < 0) top_pair = r;
+      else if (second_pair < 0) second_pair = r;
+    }
+  }
+
+  if (quads_rank >= 0) {
+    int kicker = -1;
+    for (int r = 12; r >= 0; --r)
+      if (r != quads_rank && rank_count[r] >= 1) { kicker = r; break; }
+    return pack(8, quads_rank, kicker, 0, 0, 0);
+  }
+
+  // Full house: trips + (pair or another trips). With 7 cards we can have
+  // two sets of trips; the lower set acts as the pair.
+  if (trips_rank >= 0 && (second_trips_rank >= 0 || top_pair >= 0)) {
+    int pair_rank;
+    if (second_trips_rank >= 0 && (top_pair < 0 || second_trips_rank > top_pair))
+      pair_rank = second_trips_rank;
+    else
+      pair_rank = top_pair;
+    return pack(7, trips_rank, pair_rank, 0, 0, 0);
+  }
+
+  if (flush_suit >= 0) {
+    uint16_t fmask = suit_mask[flush_suit];
+    int r[5] = {0, 0, 0, 0, 0};
+    int kept = 0;
+    for (int rr = 12; rr >= 0 && kept < 5; --rr) {
+      if (fmask & (uint16_t)(1u << rr)) { r[kept++] = rr; }
+    }
+    return pack(6, r[0], r[1], r[2], r[3], r[4]);
+  }
+
+  if (top_straight >= 0) return pack(5, top_straight, 0, 0, 0, 0);
+
+  if (trips_rank >= 0) {
+    int k0 = -1, k1 = -1;
+    for (int r = 12; r >= 0; --r) {
+      if (r != trips_rank && rank_count[r] >= 1) {
+        if (k0 < 0) k0 = r;
+        else if (k1 < 0) { k1 = r; break; }
+      }
+    }
+    return pack(4, trips_rank, k0, k1, 0, 0);
+  }
+
+  if (top_pair >= 0 && second_pair >= 0) {
+    int k0 = -1;
+    for (int r = 12; r >= 0; --r) {
+      if (r != top_pair && r != second_pair && rank_count[r] >= 1) {
+        k0 = r; break;
+      }
+    }
+    return pack(3, top_pair, second_pair, k0, 0, 0);
+  }
+
+  if (top_pair >= 0) {
+    int k[3] = {-1, -1, -1};
+    int kept = 0;
+    for (int r = 12; r >= 0 && kept < 3; --r) {
+      if (r != top_pair && rank_count[r] >= 1) k[kept++] = r;
+    }
+    return pack(2, top_pair, k[0], k[1], k[2], 0);
+  }
+
+  // High card: top 5
+  int r[5] = {0, 0, 0, 0, 0};
+  int kept = 0;
+  for (int rr = 12; rr >= 0 && kept < 5; --rr) {
+    if (rank_count[rr] >= 1) r[kept++] = rr;
+  }
+  return pack(1, r[0], r[1], r[2], r[3], r[4]);
+}
+
+// Preflop canonical-169 hand index. 13 pocket pairs (0..12) + 78 suited
+// (13..90) + 78 offsuit (91..168). Matches CPU
+// EquityModule::preflop_canonical_index exactly.
+__device__ inline int dev_preflop_canonical_169(uint8_t hole0, uint8_t hole1) {
+  int r0 = hole0 >> 2, s0 = hole0 & 3;
+  int r1 = hole1 >> 2, s1 = hole1 & 3;
+  int hi = max(r0, r1), lo = min(r0, r1);
+  if (hi == lo) return hi;             // pocket pair
+  bool suited = (s0 == s1);
+  int idx = (hi * (hi - 1)) / 2 + lo;
+  return suited ? (13 + idx) : (13 + 78 + idx);
+}
+
+// Deterministic FNV-1a 64-bit seed for a (hole, board) configuration. Same
+// algorithm as CPU EquityModule::compute_ehs2_runtime so EHS² values from
+// the same input agree across iterations within a training run.
+__device__ inline uint64_t dev_ehs2_seed(uint8_t hole0, uint8_t hole1,
+                                         const uint8_t *board, int num_board) {
+  uint64_t s = 0xcbf29ce484222325ULL;
+  s ^= (uint64_t)hole0; s *= 0x100000001b3ULL;
+  s ^= (uint64_t)hole1; s *= 0x100000001b3ULL;
+  for (int i = 0; i < num_board; ++i) {
+    s ^= (uint64_t)board[i];
+    s *= 0x100000001b3ULL;
+  }
+  return s;
+}
+
+// Monte Carlo EHS² rollout. Deterministically seeded per (hole, board) so
+// the same hand always produces the same EHS² across CFR iterations (this
+// is critical for regret consistency at the same info-set).
+//
+// n_rollouts samples. Each rollout: partial Fisher-Yates on the remaining
+// deck to draw an opponent hole pair + missing board completion. Evaluate
+// both 7-card hands. Score = 1/0.5/0 for win/tie/loss. Return mean(score²).
+//
+// Per call cost: n_rollouts × (k card swaps + 2 × dev_eval_7card_total)
+// ≈ n_rollouts × ~180 ALU ops at the river. At 50 rollouts that's ~9K
+// ops per query; called once per node visit.
+__device__ inline double dev_compute_ehs2(uint8_t hole0, uint8_t hole1,
+                                          const uint8_t *board, int num_board,
+                                          int n_rollouts);
+
+// (definition below DRng)
+
+// Nearest centroid by absolute distance in 1-D. Centroids sorted ascending.
+// Binary search to bracket then compare neighbours. ~log2(200) = 8 iters.
+__device__ inline int dev_nearest_centroid_d(double v, const double *cents,
+                                              int n) {
+  if (n <= 0) return 0;
+  if (v <= cents[0]) return 0;
+  if (v >= cents[n - 1]) return n - 1;
+  int lo = 0, hi = n - 1;
+  while (lo + 1 < hi) {
+    int m = (lo + hi) >> 1;
+    if (cents[m] <= v) lo = m;
+    else               hi = m;
+  }
+  double d_lo = v - cents[lo];
+  double d_hi = cents[hi] - v;
+  return (d_lo < d_hi) ? lo : hi;
+}
+
+// V3 device-side bucketize. Returns per-street bucket index:
+//   preflop: 0..168 (canonical-169)
+//   flop/turn/river: 0..199 (nearest of 200 centroids by EHS²)
+// The trajectory kernel composes the global 0..768 index for the save format.
+struct DV3Centroids {
+  const double *flop;   int n_flop;
+  const double *turn;   int n_turn;
+  const double *river;  int n_river;
+  int n_rollouts;
+};
+
+__device__ inline int dev_bucketize_hand_v3(const DGameState &s, int player,
+                                             const DV3Centroids &v3) {
+  uint8_t hole0 = s.hole[player][0];
+  uint8_t hole1 = s.hole[player][1];
+  if (s.stage == kPreflop || s.num_board == 0) {
+    return dev_preflop_canonical_169(hole0, hole1);
+  }
+  double e2 = dev_compute_ehs2(hole0, hole1, s.board, s.num_board,
+                                v3.n_rollouts);
+  if (s.stage == kFlop)  return dev_nearest_centroid_d(e2, v3.flop,  v3.n_flop);
+  if (s.stage == kTurn)  return dev_nearest_centroid_d(e2, v3.turn,  v3.n_turn);
+  if (s.stage == kRiver) return dev_nearest_centroid_d(e2, v3.river, v3.n_river);
+  return 0;
+}
+
+// Compose a flat 0..768 global bucket index from (stage, per_street_bucket).
+// preflop (stage=1) → 0..168
+// flop    (stage=2) → 169..368
+// turn    (stage=3) → 369..568
+// river   (stage=4) → 569..768
+// Matches EquityModule::v2_global_index exactly.
+__device__ inline int dev_v3_global_bucket(int stage, int per_street) {
+  switch (stage) {
+  case kFlop:  return kV3PreflopBuckets + per_street;                    // 169..
+  case kTurn:  return kV3PreflopBuckets + kV3PostflopBuckets + per_street;
+  case kRiver: return kV3PreflopBuckets + 2 * kV3PostflopBuckets + per_street;
+  default:     return per_street;                                        // preflop
+  }
+}
+
+// ============================================================================
 // V1 hand abstraction on device. Returns bucket id 0..9 (BucketID enum).
 // Mirrors EquityModule::bucketize_hand for the V1 path.
 // ============================================================================
@@ -269,21 +518,25 @@ __device__ inline uint8_t dev_bucketize_hand(const DGameState &s, int player) {
 // ============================================================================
 // Imperfect-recall info-set key encoding. Packs into a single uint64_t.
 //
-//   bits  0..3   bucket (0..9, 4 bits)
-//   bits  4..6   stage (1..4, 3 bits)
-//   bits  7..9   pot bucket (0..4, 3 bits)
-//   bits 10..11  preflop raise count, 0..3 capped (2 bits)
-//   bits 12..13  flop raise count    (2)
-//   bits 14..15  turn raise count    (2)
-//   bits 16..17  river raise count   (2)
-//   bits 18..19  preflop aggressor  ('-'=0, 'd'=1, 's'=2)  (2)
-//   bits 20..21  flop aggressor                              (2)
-//   bits 22..23  turn aggressor                              (2)
-//   bits 24..25  river aggressor                             (2)
-//   bits 26..27  num_legal (3..4) (2)
-//   bits 28..29  current player (2)
-//   bits 30..31  reserved
-//   bits 32..63  reserved (=0) for future extension
+// V2 layout (bumped from v0.5 to support V3's 200-bucket abstraction).
+// V1 GPU model files saved before this change are incompatible — but they
+// can be regenerated in ~20 sec with the v0.6+ binary.
+//
+//   bits  0..7   bucket (V1: 0..9, V3: per-street 0..199, 8 bits)
+//   bits  8..10  stage (1..4, 3 bits)
+//   bits 11..13  pot bucket (0..4, 3 bits)
+//   bits 14..15  preflop raise count, 0..3 capped (2 bits)
+//   bits 16..17  flop raise count    (2)
+//   bits 18..19  turn raise count    (2)
+//   bits 20..21  river raise count   (2)
+//   bits 22..23  preflop aggressor  ('-'=0, 'd'=1, 's'=2)  (2)
+//   bits 24..25  flop aggressor                              (2)
+//   bits 26..27  turn aggressor                              (2)
+//   bits 28..29  river aggressor                             (2)
+//   bits 30..31  num_legal (3..4 stored modulo 4) (2)
+//   bits 32..33  current player (2)
+//   bits 34..62  reserved (=0)
+//   bit  63      sentinel (always 1 — avoids all-zero hash slot)
 // ============================================================================
 
 __device__ inline int dev_pot_bucket(int pot, int bb) {
@@ -296,10 +549,21 @@ __device__ inline int dev_pot_bucket(int pot, int bb) {
   return 4;
 }
 
+// Compute info-set key. Branches on hand abstraction:
+//   V1: bucket = dev_bucketize_hand (0..9 heuristic)
+//   V3: bucket = per-street EHS² cluster (0..199), with stage encoding
+//       letting us reconstruct the global 0..768 index at save time.
 __device__ inline uint64_t dev_compute_infoset_key(const DGameState &s,
                                                     int player, int num_legal,
-                                                    int bb) {
-  uint8_t bucket = dev_bucketize_hand(s, player);
+                                                    int bb,
+                                                    int abstraction,
+                                                    const DV3Centroids &v3) {
+  int bucket;
+  if (abstraction == 1) {
+    bucket = dev_bucketize_hand_v3(s, player, v3);
+  } else {
+    bucket = (int)dev_bucketize_hand(s, player);
+  }
   uint8_t pot_b  = (uint8_t)dev_pot_bucket(s.pot, bb);
 
   // Walk history with proper per-street tracking. We don't store street
@@ -377,19 +641,19 @@ __device__ inline uint64_t dev_compute_infoset_key(const DGameState &s,
   }
 
   uint64_t key = 0;
-  key |= (uint64_t)(bucket & 0xF);
-  key |= ((uint64_t)(s.stage & 0x7)) << 4;
-  key |= ((uint64_t)(pot_b & 0x7))   << 7;
-  key |= ((uint64_t)(raise_cnt[0] & 0x3)) << 10;
-  key |= ((uint64_t)(raise_cnt[1] & 0x3)) << 12;
-  key |= ((uint64_t)(raise_cnt[2] & 0x3)) << 14;
-  key |= ((uint64_t)(raise_cnt[3] & 0x3)) << 16;
-  key |= ((uint64_t)(last_raiser[0] & 0x3)) << 18;
-  key |= ((uint64_t)(last_raiser[1] & 0x3)) << 20;
-  key |= ((uint64_t)(last_raiser[2] & 0x3)) << 22;
-  key |= ((uint64_t)(last_raiser[3] & 0x3)) << 24;
-  key |= ((uint64_t)(num_legal & 0x3)) << 26;
-  key |= ((uint64_t)(player & 0x3)) << 28;
+  key |= (uint64_t)(bucket & 0xFF);                       // bits  0..7
+  key |= ((uint64_t)(s.stage & 0x7))    << 8;             // bits  8..10
+  key |= ((uint64_t)(pot_b & 0x7))      << 11;            // bits 11..13
+  key |= ((uint64_t)(raise_cnt[0] & 0x3))   << 14;        // bits 14..15
+  key |= ((uint64_t)(raise_cnt[1] & 0x3))   << 16;        // bits 16..17
+  key |= ((uint64_t)(raise_cnt[2] & 0x3))   << 18;        // bits 18..19
+  key |= ((uint64_t)(raise_cnt[3] & 0x3))   << 20;        // bits 20..21
+  key |= ((uint64_t)(last_raiser[0] & 0x3)) << 22;        // bits 22..23
+  key |= ((uint64_t)(last_raiser[1] & 0x3)) << 24;        // bits 24..25
+  key |= ((uint64_t)(last_raiser[2] & 0x3)) << 26;        // bits 26..27
+  key |= ((uint64_t)(last_raiser[3] & 0x3)) << 28;        // bits 28..29
+  key |= ((uint64_t)(num_legal & 0x3))      << 30;        // bits 30..31
+  key |= ((uint64_t)(player & 0x3))         << 32;        // bits 32..33
   // Avoid the all-zero key (used as "empty slot" sentinel) by setting bit 63.
   key |= (1ULL << 63);
   return key;
@@ -489,6 +753,59 @@ __device__ inline int dev_sample_discrete(const double *probs, int n, DRng &r) {
     if (u <= acc) return i;
   }
   return n - 1;
+}
+
+// EHS² body (forward-declared above, defined here once DRng is in scope).
+__device__ inline double dev_compute_ehs2(uint8_t hole0, uint8_t hole1,
+                                          const uint8_t *board, int num_board,
+                                          int n_rollouts) {
+  // Build remaining-deck list (52 minus dealt cards).
+  uint8_t deck[52];
+  bool used[52] = {false};
+  used[hole0] = true;
+  used[hole1] = true;
+  for (int i = 0; i < num_board; ++i) used[board[i]] = true;
+  int n_deck = 0;
+  for (int c = 0; c < 52; ++c) if (!used[c]) deck[n_deck++] = (uint8_t)c;
+
+  int board_needed = 5 - num_board;
+  int k = 2 + board_needed;
+
+  // Deterministic seed → xoroshiro128+ state. Same input always produces
+  // the same EHS² so regret accumulation across CFR iters is consistent.
+  uint64_t seed = dev_ehs2_seed(hole0, hole1, board, num_board);
+  DRng rng;
+  rng.s0 = seed ^ 0x9E3779B97F4A7C15ULL;
+  rng.s1 = seed * 0xBF58476D1CE4E5B9ULL ^ 0xC2B2AE3D27D4EB4FULL;
+
+  uint8_t hero[7];
+  uint8_t opp[7];
+  hero[0] = hole0; hero[1] = hole1;
+  for (int i = 0; i < num_board; ++i) hero[2 + i] = board[i];
+
+  double sum_sq = 0.0;
+  for (int r = 0; r < n_rollouts; ++r) {
+    // Partial Fisher-Yates: shuffle first k slots of deck. Tail untouched.
+    for (int i = 0; i < k; ++i) {
+      uint64_t u = dev_next_u64(rng);
+      int j = i + (int)(u % (uint64_t)(n_deck - i));
+      uint8_t tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+    }
+    // opp hole = deck[0..1]
+    opp[0] = deck[0]; opp[1] = deck[1];
+    for (int i = 0; i < num_board; ++i) opp[2 + i] = board[i];
+    // Runout = deck[2..k-1]
+    for (int i = 0; i < board_needed; ++i) {
+      hero[2 + num_board + i] = deck[2 + i];
+      opp [2 + num_board + i] = deck[2 + i];
+    }
+    int n_full = 2 + num_board + board_needed;     // = 7 at river
+    uint32_t hv = dev_eval_7card_total(hero, n_full);
+    uint32_t ov = dev_eval_7card_total(opp,  n_full);
+    double score = (hv > ov) ? 1.0 : ((hv == ov) ? 0.5 : 0.0);
+    sum_sq += score * score;
+  }
+  return sum_sq / (double)n_rollouts;
 }
 
 // ============================================================================
@@ -714,6 +1031,8 @@ __global__ void outcome_sampling_kernel(
     int num_traj,
     int big_blind,
     double epsilon,
+    int abstraction,           // 0 = V1 heuristic, 1 = V3 EHS² clusters
+    DV3Centroids v3,           // V3 centroid pointers (unused for V1)
     DHashTable hash,
     double *regret_sum,
     double *strategy_sum,
@@ -767,7 +1086,8 @@ __global__ void outcome_sampling_kernel(
     int nlegal = dev_legal_actions(s, legal);
     if (nlegal == 0) break;
 
-    uint64_t key = dev_compute_infoset_key(s, acting, nlegal, big_blind);
+    uint64_t key = dev_compute_infoset_key(s, acting, nlegal, big_blind,
+                                            abstraction, v3);
     int info_id = dev_hash_lookup_or_insert(hash, key);
     if (info_id < 0) { fail = true; break; }
 
@@ -942,6 +1262,15 @@ struct GpuCfrEngine {
   double   *d_strategy = nullptr;
   int      *d_traversal_counter = nullptr;
 
+  // V3 centroid arrays (allocated only when cfg.hand_abstraction == V3).
+  // Loaded once at create() from equity_buckets.dat. Sorted ascending.
+  double *d_cents_flop  = nullptr;
+  double *d_cents_turn  = nullptr;
+  double *d_cents_river = nullptr;
+  int n_cents_flop  = 0;
+  int n_cents_turn  = 0;
+  int n_cents_river = 0;
+
   cudaStream_t stream = nullptr;
 
   // Profiling.
@@ -951,6 +1280,50 @@ struct GpuCfrEngine {
   long long iters = 0;
   long long trajectories = 0;
 };
+
+// Read equity_buckets.dat into three host vectors. Format documented in
+// build_equity_buckets.cpp:
+//   uint32 magic = 0x4C454342 ('LECB')
+//   uint32 version = 1
+//   for street in {flop, turn, river}:
+//     int32 n_centroids
+//     double centroid[n_centroids]
+// Returns true on success. On failure host vectors are left empty.
+static bool load_equity_buckets(const std::string &path,
+                                std::vector<double> &flop,
+                                std::vector<double> &turn,
+                                std::vector<double> &river) {
+  flop.clear(); turn.clear(); river.clear();
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (!f) {
+    std::fprintf(stderr, "[gpu_cfr] equity_buckets.dat not found at %s\n",
+                 path.c_str());
+    return false;
+  }
+  uint32_t magic = 0, version = 0;
+  if (std::fread(&magic,   sizeof(magic),   1, f) != 1 ||
+      std::fread(&version, sizeof(version), 1, f) != 1 ||
+      magic != 0x4C454342u) {
+    std::fprintf(stderr, "[gpu_cfr] equity_buckets.dat: bad magic/version\n");
+    std::fclose(f);
+    return false;
+  }
+  std::vector<double> *streets[3] = {&flop, &turn, &river};
+  for (int s = 0; s < 3; ++s) {
+    int32_t n = 0;
+    if (std::fread(&n, sizeof(n), 1, f) != 1 || n < 0) { std::fclose(f); return false; }
+    streets[s]->resize((size_t)n);
+    if (n > 0 && std::fread(streets[s]->data(), sizeof(double), (size_t)n, f) != (size_t)n) {
+      std::fclose(f); return false;
+    }
+    // Defensive: ensure ascending (CPU loader sorts; we trust that here).
+  }
+  std::fclose(f);
+  std::fprintf(stderr,
+               "[gpu_cfr] loaded equity_buckets.dat: flop=%zu turn=%zu river=%zu\n",
+               flop.size(), turn.size(), river.size());
+  return true;
+}
 
 static long long now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -984,6 +1357,39 @@ GpuCfrEngine *gpu_cfr_create(const GpuCfrConfig &cfg) {
   CUDA_CHECK(cudaMemset(eng->d_strategy, 0, mat_bytes));
   CUDA_CHECK(cudaMemset(eng->d_traversal_counter, 0, sizeof(int)));
 
+  // V3: load EHS² centroid table from disk and copy to device.
+  if (cfg.hand_abstraction == HandAbstraction::V3) {
+    std::vector<double> hf, ht, hr;
+    if (!load_equity_buckets(cfg.equity_buckets_path, hf, ht, hr)) {
+      std::fprintf(stderr,
+          "[gpu_cfr] FATAL: V3 abstraction requested but equity_buckets.dat "
+          "could not be loaded. Run build_equity_buckets first.\n");
+      gpu_cfr_destroy(eng);
+      return nullptr;
+    }
+    eng->n_cents_flop  = (int)hf.size();
+    eng->n_cents_turn  = (int)ht.size();
+    eng->n_cents_river = (int)hr.size();
+    if (eng->n_cents_flop > 0) {
+      CUDA_CHECK(cudaMalloc(&eng->d_cents_flop, hf.size() * sizeof(double)));
+      CUDA_CHECK(cudaMemcpy(eng->d_cents_flop, hf.data(),
+                            hf.size() * sizeof(double),
+                            cudaMemcpyHostToDevice));
+    }
+    if (eng->n_cents_turn > 0) {
+      CUDA_CHECK(cudaMalloc(&eng->d_cents_turn, ht.size() * sizeof(double)));
+      CUDA_CHECK(cudaMemcpy(eng->d_cents_turn, ht.data(),
+                            ht.size() * sizeof(double),
+                            cudaMemcpyHostToDevice));
+    }
+    if (eng->n_cents_river > 0) {
+      CUDA_CHECK(cudaMalloc(&eng->d_cents_river, hr.size() * sizeof(double)));
+      CUDA_CHECK(cudaMemcpy(eng->d_cents_river, hr.data(),
+                            hr.size() * sizeof(double),
+                            cudaMemcpyHostToDevice));
+    }
+  }
+
   return eng;
 }
 
@@ -1012,6 +1418,9 @@ void gpu_cfr_destroy(GpuCfrEngine *eng) {
   cudaFree(eng->d_strategy_sum);
   cudaFree(eng->d_strategy);
   cudaFree(eng->d_traversal_counter);
+  if (eng->d_cents_flop)  cudaFree(eng->d_cents_flop);
+  if (eng->d_cents_turn)  cudaFree(eng->d_cents_turn);
+  if (eng->d_cents_river) cudaFree(eng->d_cents_river);
   delete eng;
 }
 
@@ -1055,12 +1464,20 @@ double gpu_cfr_train(GpuCfrEngine *eng, int num_iterations, uint64_t base_seed) 
     int blocks = (B + threads - 1) / threads;
 
     long long t0 = now_ns();
+    int abstraction = (eng->cfg.hand_abstraction == HandAbstraction::V3) ? 1 : 0;
+    DV3Centroids v3{
+        eng->d_cents_flop,  eng->n_cents_flop,
+        eng->d_cents_turn,  eng->n_cents_turn,
+        eng->d_cents_river, eng->n_cents_river,
+        eng->cfg.ehs2_rollouts
+    };
     outcome_sampling_kernel<<<blocks, threads, 0, eng->stream>>>(
         init0, traverser,
         base_seed ^ ((uint64_t)it * 0xC2B2AE3D27D4EB4FULL),
         B,
         (int)eng->cfg.big_blind,
         eng->cfg.epsilon,
+        abstraction, v3,
         DHashTable{eng->d_keys, eng->d_values, eng->d_size,
                    kHashCapacity, kHashCapacity - 1},
         eng->d_regret_sum, eng->d_strategy_sum, eng->d_strategy,
@@ -1159,18 +1576,36 @@ bool gpu_cfr_save(GpuCfrEngine *eng, const std::string &path) {
   size_t N = entries.size();
   std::fwrite(&N, sizeof(N), 1, f);
 
-  // Decode each GPU key into the CPU's V2/V3 string format.
+  // Decode each GPU key into the CPU's V2/V3 string format. The bit layout
+  // changed in v0.6 (bucket field widened from 4 to 8 bits) — see
+  // dev_compute_infoset_key for the layout.
+  bool v3 = (eng->cfg.hand_abstraction == HandAbstraction::V3);
   static const char *AGGRESSOR = "-ds-"; // 0='-', 1='d', 2='s', 3='-'
   for (auto &[key, row] : entries) {
-    int bucket    = (int)((key >> 0)  & 0xF);
-    int stage     = (int)((key >> 4)  & 0x7);
-    int pot_b     = (int)((key >> 7)  & 0x7);
-    int rc[4]     = {(int)((key>>10)&0x3), (int)((key>>12)&0x3),
-                     (int)((key>>14)&0x3), (int)((key>>16)&0x3)};
-    int lr[4]     = {(int)((key>>18)&0x3), (int)((key>>20)&0x3),
-                     (int)((key>>22)&0x3), (int)((key>>24)&0x3)};
-    int num_legal = (int)((key >> 26) & 0x3);
-    if (num_legal == 0) num_legal = 4; // we encoded 4 as 0 (& 0x3 collision)
+    int bucket    = (int)((key >> 0)  & 0xFF);            // 8 bits
+    int stage     = (int)((key >> 8)  & 0x7);
+    int pot_b     = (int)((key >> 11) & 0x7);
+    int rc[4]     = {(int)((key>>14)&0x3), (int)((key>>16)&0x3),
+                     (int)((key>>18)&0x3), (int)((key>>20)&0x3)};
+    int lr[4]     = {(int)((key>>22)&0x3), (int)((key>>24)&0x3),
+                     (int)((key>>26)&0x3), (int)((key>>28)&0x3)};
+    int num_legal = (int)((key >> 30) & 0x3);
+    if (num_legal == 0) num_legal = 4;
+    // (player at bits 32..33 isn't part of the CPU string key.)
+
+    // For V3, the per-street bucket needs to be composed into the global
+    // 0..768 index that CPU's compute_information_set emits. For V1 the
+    // bucket is already 0..9 and is written directly.
+    int out_bucket = bucket;
+    if (v3) {
+      // dev_v3_global_bucket equivalent on host.
+      switch (stage) {
+      case 2: out_bucket = kV3PreflopBuckets + bucket; break;            // flop
+      case 3: out_bucket = kV3PreflopBuckets + kV3PostflopBuckets + bucket; break;
+      case 4: out_bucket = kV3PreflopBuckets + 2 * kV3PostflopBuckets + bucket; break;
+      default: out_bucket = bucket; break;                               // preflop
+      }
+    }
 
     int cur_street_idx = stage - 1; // stage 1=preflop → idx 0
     if (cur_street_idx < 0) cur_street_idx = 0;
@@ -1188,9 +1623,9 @@ bool gpu_cfr_save(GpuCfrEngine *eng, const std::string &path) {
     // Format matches game_state.cpp's compute_information_set V2/V3 path:
     //   "<bucket>|_|<stage>|<stack_bucket>|<pot_bucket>|<ir_summary>|<num_legal>|"
     // (V2/V3 drop the suit signature, encoded as "_".)
-    char buf[128];
+    char buf[160];
     int len = snprintf(buf, sizeof(buf), "%d|_|%d|3|%d|%s|%d|",
-                       bucket, stage, pot_b, ir.c_str(), num_legal);
+                       out_bucket, stage, pot_b, ir.c_str(), num_legal);
     size_t key_len = (size_t)len;
     std::fwrite(&key_len, sizeof(key_len), 1, f);
     std::fwrite(buf, 1, key_len, f);

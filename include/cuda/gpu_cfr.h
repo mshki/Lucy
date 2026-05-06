@@ -57,12 +57,30 @@ constexpr int kMaxDepth = 32;
 
 // Hash-table capacity. Power of 2. 1<<19 = 524,288 slots is plenty for HU
 // NLHE FCPA + V1 hand abstraction + imperfect-recall keys (typical info-set
-// count under this abstraction is well under 100k). Memory: ~6 MB hash +
-// ~50 MB regret/strategy tables at MAX_ACTIONS=4. Cheap and the
-// regret-match kernel only loops over this many rows per iteration —
-// keeping it small is what makes the per-iter wallclock competitive.
-constexpr int kHashCapacityLog2 = 19;
+// count under this abstraction is well under 100k). For V3 (200 buckets per
+// post-flop street) the count grows ~20x; we bump to 1<<20 = 1M slots.
+// Memory: ~12 MB hash + ~100 MB regret/strategy tables at MAX_ACTIONS=4.
+// The regret-match kernel only loops over this many rows per iteration so
+// the cost is bounded.
+constexpr int kHashCapacityLog2 = 20;
 constexpr int kHashCapacity = 1 << kHashCapacityLog2;
+
+// Hand abstraction selector.
+//   V1: 10-bucket heuristic (no rollouts, fast). Existing default.
+//   V3: EHS²-clustered buckets (169 preflop canonical, 200/200/200 post-flop
+//       K-means centroids). Requires equity_buckets.dat at engine create.
+//       Per node visit: O(rollouts × 2 × 80) extra ops for the EHS²
+//       Monte Carlo rollouts on device. ~5-8x slower per trajectory than
+//       V1 but ~1500 mbb/h stronger play (matches CPU V3 quality).
+enum class HandAbstraction : uint8_t {
+  V1 = 0,
+  V3 = 1,
+};
+
+// V3 cluster counts per street (must match build_equity_buckets defaults
+// and the on-disk equity_buckets.dat layout).
+constexpr int kV3PreflopBuckets = 169;
+constexpr int kV3PostflopBuckets = 200;
 
 // Configuration for one training run.
 struct GpuCfrConfig {
@@ -80,6 +98,18 @@ struct GpuCfrConfig {
   // more device memory for trajectory buffers (each trajectory keeps
   // up to kMaxDepth * (info_id + sigma vector) bytes in shared/registers).
   int batch_size        = 4096;
+
+  // Hand abstraction. V1 (default) uses the 10-bucket heuristic and is the
+  // existing fast path. V3 uses EHS² K-means clusters and produces ~1500
+  // mbb/h stronger play at the cost of per-trajectory device work.
+  HandAbstraction hand_abstraction = HandAbstraction::V1;
+  // Path to equity_buckets.dat (V3 only; ignored for V1). Empty string
+  // searches cwd. The file is produced by `build_equity_buckets`.
+  std::string equity_buckets_path  = "equity_buckets.dat";
+  // Number of MC rollouts per EHS² query (V3 only). 50 matches the
+  // build_equity_buckets default. Increasing improves bucket assignment
+  // accuracy at a linear wallclock cost; 100 is "production".
+  int ehs2_rollouts                = 50;
 };
 
 // Lifetime of the device engine: create -> train -> save / query -> destroy.
