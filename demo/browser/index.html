@@ -139,6 +139,30 @@ button:disabled { background: #444; cursor: not-allowed; }
 }
 .status.running { background: var(--green); }
 .status.stopped { background: var(--gray); }
+
+.actions {
+  margin: 14px auto 0;
+  display: flex; gap: 10px; justify-content: center;
+  padding: 14px;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 10px;
+  min-height: 60px;
+  align-items: center;
+}
+.actions .pill {
+  padding: 12px 22px; border-radius: 8px;
+  border: 2px solid transparent;
+  font-size: 15px; font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.1s, border-color 0.1s;
+}
+.actions .pill:hover { transform: translateY(-1px); }
+.actions .pill.fold  { background: var(--red); color: white; }
+.actions .pill.call  { background: #16a085; color: white; }
+.actions .pill.pot   { background: var(--gold); color: #2c3e50; }
+.actions .pill.allin { background: #8e44ad; color: white; }
+.actions .pill:disabled { opacity: 0.4; cursor: not-allowed; }
+.actions .wait { color: var(--gray); font-style: italic; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -174,6 +198,13 @@ button:disabled { background: #444; cursor: not-allowed; }
       <div class="board" id="board">[ pre-flop ]</div>
       <div class="pot">pot: <span id="pot">0</span></div>
       <div class="last-action" id="last-action">&nbsp;</div>
+    </div>
+
+    <div class="actions" id="action-row" style="display:none">
+      <button class="pill fold"  id="btn-fold"  onclick="humanAct(0)">Fold</button>
+      <button class="pill call"  id="btn-call"  onclick="humanAct(1)">Check / Call</button>
+      <button class="pill pot"   id="btn-pot"   onclick="humanAct(2)">Pot raise</button>
+      <button class="pill allin" id="btn-allin" onclick="humanAct(3)">All-in</button>
     </div>
 
     <div class="score">
@@ -229,6 +260,14 @@ function fmt_chips(c) {
   return bb >= 0
     ? `+${bb.toFixed(1)} BB`
     : `${bb.toFixed(1)} BB`;
+}
+
+async function humanAct(action) {
+  await fetch("/api/human/act", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action})
+  });
 }
 
 async function refresh() {
@@ -290,6 +329,36 @@ async function refresh() {
   // Log
   document.getElementById("log").innerHTML =
     (s.log || []).slice().reverse().map(l => `<div>${l}</div>`).join("");
+
+  // Action buttons (human-vs-Lucy mode only)
+  const row = document.getElementById("action-row");
+  if (s.mode === "human") {
+    row.style.display = "flex";
+    if (s.human_turn) {
+      row.querySelector(".wait")?.remove();
+      const legal = new Set(s.legal_actions || []);
+      ["fold", "call", "pot", "allin"].forEach((cls, idx) => {
+        const btn = document.getElementById("btn-" + cls);
+        btn.disabled = !legal.has(idx);
+        btn.style.display = "inline-block";
+      });
+    } else {
+      ["fold", "call", "pot", "allin"].forEach(cls => {
+        const btn = document.getElementById("btn-" + cls);
+        btn.disabled = true;
+      });
+      if (!row.querySelector(".wait")) {
+        const w = document.createElement("span");
+        w.className = "wait";
+        w.innerText = s.running
+          ? `${s.label_a} is thinking...`
+          : "click Start match to deal a hand";
+        row.appendChild(w);
+      }
+    }
+  } else {
+    row.style.display = "none";
+  }
 }
 
 refresh();
