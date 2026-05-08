@@ -79,14 +79,4 @@ set_target_properties(build_equity_buckets PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
 )
 
-# Demo executable (kernel sandbox) — only when CUDA is available.
-if(CMAKE_CUDA_COMPILER)
-    add_executable(demo_code demo_code.cu)
-    target_compile_features(demo_code PRIVATE cxx_std_20)
-    set_target_properties(demo_code PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON
-        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/build/bin
-    )
-endif()
+

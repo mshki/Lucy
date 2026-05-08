@@ -569,8 +569,6 @@ int main(int argc, char *argv[]) {
     auto t0 = std::chrono::steady_clock::now();
 
     if (a.device == "gpu") {
-      // GPU-resident outcome-sampling MCCFR. V1 hand abstraction + FCPA
-      // betting only in v0.5; richer abstractions are CPU-only for now.
       gpu_cfr::GpuCfrConfig gcfg;
       gcfg.num_players      = a.players;
       gcfg.small_blind      = a.sb;
@@ -578,7 +576,6 @@ int main(int argc, char *argv[]) {
       gcfg.starting_stack   = a.stack_bb * a.bb;
       gcfg.epsilon          = a.outcome_epsilon;
       gcfg.batch_size       = a.gpu_traj_per_iter;
-      // Map --cfr-variant to DCFR knobs (match CPU side).
       if (a.cfr_variant == "vanilla") {
         gcfg.dcfr_alpha = 1e30; gcfg.dcfr_beta = 1e30; gcfg.dcfr_gamma = 0.0;
       } else if (a.cfr_variant == "linear") {
@@ -589,28 +586,18 @@ int main(int argc, char *argv[]) {
         gcfg.dcfr_alpha = 1.5; gcfg.dcfr_beta = 0.0; gcfg.dcfr_gamma = 2.0;
       }
 
-      // Hand abstraction: V1 / V1_IR collapse to GPU V1 (same on-device
-      // bucketing). V3 enables device-side EHS² rollouts. V2 is CPU-only.
       if (a.hand_abstraction == HandAbstraction::V3_EHS_CLUSTERS) {
         gcfg.hand_abstraction = gpu_cfr::HandAbstraction::V3;
-        std::cerr << "[lucy-gpu] hand abstraction: V3 (EHS² clusters, "
-                  << "device-side rollouts; ~5-8x slower than V1 but "
-                  << "produces stronger play)\n";
       } else if (a.hand_abstraction == HandAbstraction::V2_VALUE_QUANTILES) {
-        std::cerr << "[lucy-gpu] V2 hand abstraction not supported on GPU "
-                  << "(needs OMP value LUT). Use --hand-abstraction v3 "
-                  << "for device-side rollouts, or --device cpu for V2.\n";
+        std::cerr << "[lucy-gpu] V2 not supported on GPU; use v3 or cpu\n";
         return 2;
       } else {
         gcfg.hand_abstraction = gpu_cfr::HandAbstraction::V1;
-        std::cerr << "[lucy-gpu] hand abstraction: V1 (10-bucket heuristic)\n";
       }
 
       auto *eng = gpu_cfr::gpu_cfr_create(gcfg);
       if (!eng) {
-        std::cerr << "[lucy] --device gpu requested but engine creation "
-                  << "failed (no CUDA, missing equity_buckets.dat for V3, "
-                  << "etc.). Aborting.\n";
+        std::cerr << "[lucy] --device gpu engine create failed\n";
         return 1;
       }
       uint64_t seed64 = a.seed != 0 ? (uint64_t)a.seed : 0xCAFEBABEDEADBEEFULL;

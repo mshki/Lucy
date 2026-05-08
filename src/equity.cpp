@@ -252,34 +252,8 @@ int EquityModule::bucketize_hand_v3(const std::vector<Card> &hero_hand,
   return nearest_centroid(ehs2, *centroids);
 }
 
-// ============================================================================
-// GPU-compatible V3 bucketing.
-//
-// The GPU's dev_compute_ehs2 + dev_eval_7card_total uses xoroshiro128+ as its
-// PRNG and a hand-rolled 32-bit total-ordering 7-card evaluator. The default
-// `compute_ehs2_runtime` above uses std::mt19937_64 + OMPEval. For the same
-// (hole, board) input both algorithms compute statistically equivalent EHS²
-// values, but their per-rollout random draws differ → bit-identical
-// reproduction is impossible without using the same algorithm on both sides.
-//
-// Without bit-identical reproduction, ~10–30% of borderline hands end up in
-// different K-means clusters between CPU and GPU, which means CPU --serve
-// loading a GPU-trained V3 model produces a per-query info-set string that
-// often DOESN'T MATCH any key in the model → uniform fallback. The result is
-// V3 GPU plays significantly weaker than V1 GPU when served from CPU, even
-// though the GPU model itself is well-trained.
-//
-// The fix below ports the exact GPU device algorithm to host code:
-//   * xoroshiro128+ PRNG seeded identically (FNV-1a from cards)
-//   * Same partial Fisher-Yates shuffle (`u % (n_remaining - i)` index)
-//   * Same 32-bit total-ordering evaluator (categorical 1..9 + kicker pack)
-//
-// Used by HandAbstraction::V3_IR mode in compute_information_set.
-// ============================================================================
-
 namespace {
 
-// xoroshiro128+ — identical to dev_next_u64 in src/cuda/gpu_cfr.cu.
 struct HRng { uint64_t s0, s1; };
 
 inline uint64_t hr_rotl(uint64_t x, int k) {
@@ -294,7 +268,6 @@ inline uint64_t hr_next_u64(HRng &r) {
   return result;
 }
 
-// FNV-1a 64-bit seed — matches dev_ehs2_seed exactly.
 inline uint64_t hr_ehs2_seed(uint8_t hole0, uint8_t hole1,
                               const uint8_t *board, int num_board) {
   uint64_t s = 0xcbf29ce484222325ULL;
@@ -307,9 +280,6 @@ inline uint64_t hr_ehs2_seed(uint8_t hole0, uint8_t hole1,
   return s;
 }
 
-// Total-ordering 7-card hand evaluator — identical to dev_eval_7card_total.
-// Returns a 32-bit value where higher = stronger; bits 24..27 = category
-// 1..9, bits 4..23 = up to 5 kicker ranks × 4 bits.
 inline uint32_t hr_eval_7card_total(const uint8_t *cards, int num_cards) {
   int rank_count[13] = {0};
   uint16_t suit_mask[4] = {0, 0, 0, 0};
@@ -440,7 +410,6 @@ inline uint32_t hr_eval_7card_total(const uint8_t *cards, int num_cards) {
   return pack(1, r[0], r[1], r[2], r[3], r[4]);
 }
 
-// Host-side EHS² rollout — bit-for-bit identical to dev_compute_ehs2.
 inline double hr_compute_ehs2(uint8_t hole0, uint8_t hole1,
                                const uint8_t *board, int num_board,
                                int n_rollouts) {
@@ -508,8 +477,6 @@ int EquityModule::bucketize_hand_v3_gpu_compatible(
     return bucketize_hand_v2(hero_hand, board_cards, st);
   }
 
-  // Pack hole + board into uint8_t arrays (rank * 4 + suit, identical to
-  // GPU's DGameState card encoding).
   uint8_t hole0 = (uint8_t)((int)hero_hand[0].rank * 4 + (int)hero_hand[0].suit);
   uint8_t hole1 = (uint8_t)((int)hero_hand[1].rank * 4 + (int)hero_hand[1].suit);
   uint8_t board[5] = {0};

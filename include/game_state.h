@@ -52,14 +52,10 @@ enum class BettingAbstraction { LEGACY, FCPA, STREET_RICH };
 //        strength AND draw potential. Pluribus / Slumbot / Libratus standard.
 enum class HandAbstraction {
   V1_HEURISTIC_10,
-  V1_IR,                  // V1 buckets + IR keys + no suit-canonical signature.
-                          // Matches the GPU CFR engine's key format so GPU-
-                          // trained models load directly into CPU serve mode.
+  V1_IR,
   V2_VALUE_QUANTILES,
   V3_EHS_CLUSTERS,
-  V3_IR,                  // V3 buckets + IR keys + no suit-canonical signature
-                          // + fixed stack_bucket=3 (matches GPU V3 emit). Use
-                          // this in --serve mode to load GPU-trained V3 models.
+  V3_IR,
 };
 
 // Minimal player struct for MCCFR

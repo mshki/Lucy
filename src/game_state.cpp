@@ -287,8 +287,6 @@ string GameState::compute_information_set(int player_id) {
   int bucket = 0;
   if (equity_module && p->hole_cards.size() >= 2) {
     if (hand_abstraction == HandAbstraction::V3_IR) {
-      // V3_IR uses the GPU-compatible algorithm so CPU --serve produces
-      // bit-identical EHS² values to GPU training, eliminating bucket drift.
       int per_street = equity_module->bucketize_hand_v3_gpu_compatible(
           p->hole_cards, community_cards, st);
       bucket = equity_module->v2_global_index(static_cast<int>(st), per_street);
@@ -307,10 +305,6 @@ string GameState::compute_information_set(int player_id) {
     }
   }
 
-  // V1 includes the suit-canonical signature in the info-set key (huge for
-  // distinguishing strategically equivalent boards). V1_IR / V2 / V3 drop
-  // the signature: V1_IR / V3_IR for GPU-format compat, V2/V3 because OMP /
-  // EHS² clustering already encodes board / hand strength.
   std::string suit_signature = "_";
   if (hand_abstraction == HandAbstraction::V1_HEURISTIC_10
       && equity_module && p->hole_cards.size() >= 2) {
@@ -343,9 +337,6 @@ string GameState::compute_information_set(int player_id) {
   // Abstract stack size to buckets
   double stack_bb = p->stack / bb;
   int stack_bucket = abstract_stack_size(stack_bb);
-  // V1_IR / V3_IR: GPU-CFR engine doesn't track stack_bucket separately; it
-  // always assumes the start-of-hand bucket. Use a fixed "3" (medium-deep,
-  // 100bb) to match the keys the GPU emits.
   if (hand_abstraction == HandAbstraction::V1_IR
       || hand_abstraction == HandAbstraction::V3_IR) {
     stack_bucket = 3;
@@ -366,8 +357,6 @@ string GameState::compute_information_set(int player_id) {
   //       that don't change the strategic situation (e.g. who-bet-first
   //       within the same street is collapsed). Cuts infoset count ~3-5x
   //       at no equilibrium quality loss in practice.
-  // V1: full per-action history. V1_IR / V2 / V3 / V3_IR: imperfect-recall
-  // summary (per-street raise count + last-aggressor only).
   if (hand_abstraction == HandAbstraction::V1_HEURISTIC_10) {
     info += abstract_action_history() + "|";
   } else {
